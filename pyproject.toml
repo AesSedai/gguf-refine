@@ -1,0 +1,16 @@
+[project]
+name = "gguf-refine"
+version = "0.1.0"
+description = "Hessian-refined stock-format GGUF quantization, type allocation and KLD evaluation"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2", "torch>=2.5", "triton>=3.1", "pyyaml", "requests", "tqdm"]  # torch / triton for refinement; the rest for gguf-py
+
+[project.optional-dependencies]
+kimi = ["safetensors"]
+
+[tool.setuptools.packages.find]
+include = ["ggufrefine*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

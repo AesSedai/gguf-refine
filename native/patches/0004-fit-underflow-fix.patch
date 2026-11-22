@@ -1,0 +1,28 @@
+common/fit: avoid n_layer/n_part underflow when only full layers remain on the last device.
+
+diff --git a/common/fit.cpp b/common/fit.cpp
+index 7ab89cc09..f42484917 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -852,7 +852,8 @@ static void common_params_fit_impl(
+     for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
+         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+         for (size_t jd = id_dense_start; jd < nd; jd++) {
+-            const uint32_t n_layer_move = jd < nd - 1 ? ngl_per_device_high[jd].n_layer : ngl_per_device_high[jd].n_layer - 1;
++            const uint32_t n_layer_move = jd < nd - 1 ? ngl_per_device_high[jd].n_layer :
++                (ngl_per_device_high[jd].n_layer > 0 ? ngl_per_device_high[jd].n_layer - 1 : 0);
+             ngl_per_device_high[id].n_layer += n_layer_move;
+             ngl_per_device_high[jd].n_layer -= n_layer_move;
+             ngl_per_device_high[jd].n_part = 0;
+@@ -909,7 +910,10 @@ static void common_params_fit_impl(
+         }
+ 
+         // try to fit at least part of one more layer
+-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
++        // requires id_dense_start to still hold a partial (dense-only) layer that can be split off;
++        // without the n_part check the n_part-- below underflows when only full layers remain
++        if (ngl_per_device[id_dense_start].n_part > 0 &&
++            ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+             size_t id_dense_start_test = id_dense_start;
+             ngl_per_device_test[id_dense_start_test].n_layer--;

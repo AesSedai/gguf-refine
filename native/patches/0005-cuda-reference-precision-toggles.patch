@@ -1,0 +1,97 @@
+Opt-in env toggles for measuring the ggml reference against fp32: GGML_CUBLAS_COMPUTE_TYPE=f32-bf16,
+GGML_CUDA_MM_INVARIANT (all mul_mat via cuBLAS), GGML_CUDA_MOE_F32 (MoE via the f32 path),
+GGML_CUDA_MMF_NO_TF32. Default behaviour unchanged.
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a2db28ade..f561f35fc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2156,6 +2172,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+         }
+         if (env_cpp == "f32" || env_cpp == "fp32") {
+             compute_type = GGML_TYPE_F32;
++        } else if (env_cpp == "f32-bf16") {
++            if (src0->type == GGML_TYPE_BF16) {
++                compute_type = GGML_TYPE_F32;
++            }
+         } else if (env_cpp == "f16" || env_cpp == "fp16") {
+             compute_type = GGML_TYPE_F16;
+         } else if (env_cpp == "bf16") {
+@@ -2552,6 +2572,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+ 
++    // GGML_CUDA_MM_INVARIANT: send every mul_mat to cuBLAS regardless of ne11.
++    //
++    // The dispatch below picks between five structurally different kernels based on
++    // ne11 (the token count), so the same weights reduce over K in a different order
++    // in a batched prefill than in a single-token decode. For a MoE model that lands
++    // on top-k routing and selects different experts; measured on Kimi-K3, 7.4% of
++    // token-layer routing decisions change between -ub 512 and -ub 16.
++    //
++    // This is a diagnostic toggle, not a fix: it removes ggml's own ne11-dependence
++    // but cuBLAS still chooses its algorithm per shape, so invariance is not
++    // guaranteed - which is exactly what makes it worth measuring.
++    static const bool mm_invariant = getenv("GGML_CUDA_MM_INVARIANT") != nullptr;
++    if (mm_invariant) {
++        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
++        return;
++    }
++
+     if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
+         // The custom vector kernel can be used over batched cuBLAS GEMM.
+         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+@@ -2599,6 +2636,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+ // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
+ // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
++    static const bool moe_f32 = getenv("GGML_CUDA_MOE_F32") != nullptr;
++    if (moe_f32) {
++        return true;
++    }
++
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+@@ -2648,8 +2690,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+ 
++    static const bool moe_f32 = getenv("GGML_CUDA_MOE_F32") != nullptr;
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++    if (!moe_f32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         // up to 24 tokens few-row MMQ is faster than MMQ, on DGX Spark also faster than MMVQ
+         const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
+ 
+@@ -2697,7 +2741,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     GGML_ASSERT(nb12 % nb11 == 0);
+     GGML_ASSERT(nb2  % nb1  == 0);
+ 
+-    const ggml_type type_src1_sorted = (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
++    const ggml_type type_src1_sorted = moe_f32 || (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
+         || ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3 ? GGML_TYPE_F32 : src0->type;
+     const ggml_type type_dst_sorted  = GGML_TYPE_F32;
+     const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index 396ad1c11..2a5d76365 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -135,6 +135,16 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
+ 
+ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
+         const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {
++    static const bool no_tf32 = getenv("GGML_CUDA_MMF_NO_TF32") != nullptr;
++    if (type == GGML_TYPE_F32 && no_tf32) {
++        return false;
++    }
++
++    static const bool moe_f32 = getenv("GGML_CUDA_MOE_F32") != nullptr;
++    if (mul_mat_id && moe_f32) {
++        return false;
++    }
++
+     if (ggml_is_quantized(type)) {
+         return false;
+     }

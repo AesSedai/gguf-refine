@@ -1,0 +1,87 @@
+llama-imatrix: bucket routed rows by expert and accumulate experts in parallel (OpenMP).
+
+diff --git a/tools/imatrix/imatrix.cpp b/tools/imatrix/imatrix.cpp
+index 7abd83ead..fa73a86bf 100644
+--- a/tools/imatrix/imatrix.cpp
++++ b/tools/imatrix/imatrix.cpp
+@@ -643,29 +643,42 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void *
+         const int64_t n_tokens = src1->ne[2];
+         const bool has_act = !e.activations.empty();
+ 
+-        // single pass over the routing ids
+-        std::vector<uint8_t> touched(n_as, 0);
+-        for (int64_t idx = 0; idx < n_ids; ++idx) {
+-            for (int64_t row = 0; row < n_tokens; ++row) {
+-                const int32_t ex = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
+-                GGML_ASSERT(ex >= 0 && ex < n_as);  // sanity check
+-                const int64_t i11 = idx % src1->ne[1];
+-                const float * x = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
+-                float * acc = e.values.data() + ex * ne0;
+-                float * act = has_act ? e.activations.data() + ex * ne0 : nullptr; // legacy imatrix tensors do not have activation sums
++        // bucket (idx, row) pairs by routed expert; serial and cheap
++        std::vector<std::vector<std::pair<int32_t, int32_t>>> buckets(n_as);
++        for (int64_t row = 0; row < n_tokens; ++row) {
++            for (int64_t idx = 0; idx < n_ids; ++idx) {
++                const int excur = *(const int32_t *) (m_ids.data() + row*ids->nb[1] + idx*ids->nb[0]);
++                GGML_ASSERT(excur >= 0 && excur < n_as); // sanity check
++                buckets[excur].emplace_back((int32_t)idx, (int32_t)row);
++            }
++        }
+ 
+-                e.counts[ex]++;
+-                touched[ex] = 1;
++        // parallel accumulation: each expert owns a disjoint slice of e.values / e.activations,
++        // so no synchronization is needed across threads
++        #pragma omp parallel for schedule(dynamic)
++        for (int64_t ex = 0; ex < n_as; ++ex) {
++            const auto & bucket = buckets[ex];
++            if (bucket.empty()) continue;
++            float * acc = e.values.data() + ex*ne0;
++            float * act = has_act ? e.activations.data() + ex*ne0 : nullptr; // legacy imatrix tensors do not have activation sums
++            for (const auto & pr : bucket) {
++                const int64_t idx = pr.first;
++                const int64_t row = pr.second;
++                const int64_t i11 = idx % src1->ne[1];
++                const float * x = (const float *)(data + i11*src1->nb[1] + row*src1->nb[2]);
+                 for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
+                 if (act) {
+                     for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                 }
+             }
++            e.counts[ex] += (int64_t)bucket.size();
+         }
+ 
+         // check for non-finite values, only checking experts that were routed to and touched
++        // (NaN is absorbing, so a non-finite value at any point during accumulation is still
++        //  non-finite here — one sweep per tensor replaces the per-accumulation check)
+         for (int64_t ex = 0; ex < n_as; ++ex) {
+-            if (touched[ex] && !all_finite(e.values.data() + ex * ne0, ne0)) {
++            if (!buckets[ex].empty() && !all_finite(e.values.data() + ex*ne0, ne0)) {
+                 LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+                 exit(1);
+             }
+@@ -733,7 +746,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void *
+             }
+         }
+ 
+-        // check for non-finite values
++        // check for non-finite values, once per tensor instead of per-accumulation
+         if (!all_finite(e.values.data(), e.values.size())) {
+             LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+             exit(1);
+diff --git a/tools/imatrix/CMakeLists.txt b/tools/imatrix/CMakeLists.txt
+index 361c4577d..9af963c44 100644
+--- a/tools/imatrix/CMakeLists.txt
++++ b/tools/imatrix/CMakeLists.txt
+@@ -3,6 +3,11 @@ add_executable(${TARGET} imatrix.cpp)
+ target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+ target_compile_features(${TARGET} PRIVATE cxx_std_17)
+ 
++find_package(OpenMP)
++if(OpenMP_CXX_FOUND)
++    target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
++endif()
++
+ if(LLAMA_TOOLS_INSTALL)
+     install(TARGETS ${TARGET} RUNTIME)
+ endif()

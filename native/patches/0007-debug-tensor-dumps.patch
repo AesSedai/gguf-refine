@@ -1,0 +1,245 @@
+eval-callback / common debug: LLAMA_DUMP_TENSORS_DIR per-tensor .npy dumps and LLAMA_NAN_PROBE;
+llama-debug parses special tokens in the prompt.
+
+diff --git a/common/debug.cpp b/common/debug.cpp
+index 102c6924d..7e2d89654 100644
+--- a/common/debug.cpp
++++ b/common/debug.cpp
+@@ -4,16 +4,100 @@
+ #include "log.h"
+ 
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
+ #include <regex>
+ #include <string>
++#include <sys/stat.h>
+ #include <vector>
+ 
+ struct common_debug_cb_user_data::impl {
+-    std::vector<uint8_t>    data;
+-    std::vector<std::regex> tensor_filters;
+-    bool                    abort_on_nan{false};
++    std::vector<uint8_t>            data;
++    std::vector<std::regex>         tensor_filters;
++    bool                            abort_on_nan{false};
++    bool                            nan_probe_only{false}; // from $LLAMA_NAN_PROBE: scan every tensor for NaN/inf and abort
++    std::string                     dump_dir;        // from $LLAMA_DUMP_TENSORS_DIR
++    std::map<std::string, int>      dump_counts;     // disambiguate repeated names within one forward
+ };
+ 
++// Write tensor as a numpy .npy file (float32, C-contiguous). Tensors are
++// resident on a backend buffer; this function expects a host-readable byte
++// buffer with the tensor's strided (nb) layout. We emit the canonical
++// (ne[3], ne[2], ne[1], ne[0]) shape collapsed to leading non-trivial dims.
++static void common_debug_save_npy(const std::string & path,
++                                  const uint8_t * data, ggml_type type,
++                                  const int64_t * ne, const size_t * nb) {
++    FILE * fp = std::fopen(path.c_str(), "wb");
++    if (!fp) {
++        LOG_ERR("debug-dump: failed to open %s\n", path.c_str());
++        return;
++    }
++    // build shape list: drop trailing 1s
++    int ndim = 4;
++    while (ndim > 1 && ne[ndim - 1] == 1) ndim--;
++    // numpy header: shape is (ne[ndim-1], ..., ne[0]) — outermost first
++    std::string shape;
++    for (int i = ndim - 1; i >= 0; --i) {
++        shape += std::to_string(ne[i]);
++        shape += (i == 0 && ndim == 1) ? "," : (i > 0 ? ", " : "");
++    }
++    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + shape + "), }";
++    // pad header so total preamble length is a multiple of 64; preamble = 6+2+2+header_len+1 (for \n)
++    const size_t pre = 6 + 2 + 2; // magic(6) + ver(2) + headerlen(2)
++    size_t hl = header.size() + 1; // +1 for trailing \n
++    size_t pad = (64 - (pre + hl) % 64) % 64;
++    header.append(pad, ' ');
++    header.push_back('\n');
++    uint16_t hl16 = (uint16_t)header.size();
++    std::fwrite("\x93NUMPY", 1, 6, fp);
++    uint8_t ver[2] = { 1, 0 };
++    std::fwrite(ver, 1, 2, fp);
++    std::fwrite(&hl16, 2, 1, fp);
++    std::fwrite(header.data(), 1, header.size(), fp);
++    // write float32 data, in C order: outer = ne[3], then ne[2], ne[1], ne[0]
++    for (int64_t i3 = 0; i3 < ne[3]; ++i3) {
++        for (int64_t i2 = 0; i2 < ne[2]; ++i2) {
++            for (int64_t i1 = 0; i1 < ne[1]; ++i1) {
++                for (int64_t i0 = 0; i0 < ne[0]; ++i0) {
++                    size_t off = i3 * nb[3] + i2 * nb[2] + i1 * nb[1] + i0 * nb[0];
++                    float v;
++                    if (type == GGML_TYPE_F32) {
++                        v = *(const float *) &data[off];
++                    } else if (type == GGML_TYPE_F16) {
++                        v = ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[off]);
++                    } else if (type == GGML_TYPE_BF16) {
++                        v = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &data[off]);
++                    } else if (type == GGML_TYPE_I32) {
++                        v = (float) *(const int32_t *) &data[off];
++                    } else if (type == GGML_TYPE_I64) {
++                        v = (float) *(const int64_t *) &data[off];
++                    } else {
++                        v = 0.0f; // unsupported type
++                    }
++                    std::fwrite(&v, sizeof(float), 1, fp);
++                }
++            }
++        }
++    }
++    std::fclose(fp);
++}
++
++static std::string common_debug_sanitize_filename(const char * name) {
++    std::string out;
++    for (const char * p = name; *p; ++p) {
++        char c = *p;
++        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
++            (c >= 'A' && c <= 'Z') || c == '-' || c == '_' || c == '.') {
++            out += c;
++        } else {
++            out += '_';
++        }
++    }
++    return out;
++}
++
+ common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {}
+ common_debug_cb_user_data::~common_debug_cb_user_data() = default;
+ 
+@@ -30,6 +114,18 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
+     }
+     pimpl->abort_on_nan = abort_on_nan;
+ 
++    if (std::getenv("LLAMA_NAN_PROBE") != nullptr) {
++        pimpl->nan_probe_only = true;
++        pimpl->abort_on_nan   = true;
++        LOG_INF("nan-probe: scanning every output tensor for NaN/inf, will abort on first occurrence\n");
++    }
++
++    if (const char * dir = std::getenv("LLAMA_DUMP_TENSORS_DIR")) {
++        pimpl->dump_dir = dir;
++        mkdir(dir, 0755);
++        LOG_INF("debug-dump: writing matched tensors as .npy under %s\n", dir);
++    }
++
+     params.cb_eval           = common_debug_cb_eval;
+     params.cb_eval_user_data = this;
+ }
+@@ -151,6 +247,59 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+         return true;  // Always retrieve data
+     }
+ 
++    // NaN-probe-only: scan every floating-point output tensor for NaN/inf and abort on the first hit.
++    // No printing; minimal data transfer (one host-side scan per tensor).
++    if (pimpl->nan_probe_only) {
++        if (ggml_is_quantized(t->type) ||
++            (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
++            return true;
++        }
++        // Skip attention mask tensors — -inf at masked positions is by design.
++        if (std::strstr(t->name, "mask") != nullptr) {
++            return true;
++        }
++        const bool is_host_p = ggml_backend_buffer_is_host(t->buffer);
++        const uint8_t * data;
++        if (is_host_p) {
++            data = (const uint8_t *) t->data;
++        } else {
++            auto n_bytes = ggml_nbytes(t);
++            pimpl->data.resize(n_bytes);
++            ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
++            data = pimpl->data.data();
++        }
++        bool bad = false;
++        float bad_val = 0.0f;
++        int64_t bad_idx[4] = {0,0,0,0};
++        for (int64_t i3 = 0; i3 < t->ne[3] && !bad; i3++) {
++            for (int64_t i2 = 0; i2 < t->ne[2] && !bad; i2++) {
++                for (int64_t i1 = 0; i1 < t->ne[1] && !bad; i1++) {
++                    for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
++                        const float v = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, i2, i3);
++                        if (std::isnan(v) || std::isinf(v)) {
++                            bad = true;
++                            bad_val = v;
++                            bad_idx[0] = i0; bad_idx[1] = i1; bad_idx[2] = i2; bad_idx[3] = i3;
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        if (bad) {
++            LOG_ERR("nan-probe: first %s in tensor '%s' op=%s type=%s shape=[%s] at idx=[%lld,%lld,%lld,%lld] src0='%s' src1='%s'\n",
++                    std::isnan(bad_val) ? "NaN" : (bad_val > 0 ? "+inf" : "-inf"),
++                    t->name, ggml_op_desc(t), ggml_type_name(t->type),
++                    common_ggml_ne_string(t).c_str(),
++                    (long long) bad_idx[0], (long long) bad_idx[1],
++                    (long long) bad_idx[2], (long long) bad_idx[3],
++                    src0 ? src0->name : "(null)", src1 ? src1->name : "(null)");
++            std::fflush(stdout);
++            std::abort();
++        }
++        return true;
++    }
++
+     bool matches_filter = pimpl->tensor_filters.empty();
+ 
+     if (!matches_filter) {
+@@ -184,6 +333,15 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+     if (!ggml_is_quantized(t->type) && matches_filter) {
+         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
+         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
++        if (!pimpl->dump_dir.empty()) {
++            const std::string base = common_debug_sanitize_filename(t->name);
++            int idx = pimpl->dump_counts[base]++;
++            const std::string fname = (idx == 0) ? (base + ".npy")
++                                                 : (base + "_" + std::to_string(idx) + ".npy");
++            const std::string path  = pimpl->dump_dir + "/" + fname;
++            common_debug_save_npy(path, data, t->type, t->ne, t->nb);
++            LOG_INF("debug-dump: wrote %s\n", path.c_str());
++        }
+     }
+ 
+     return true;
+diff --git a/examples/eval-callback/eval-callback.cpp b/examples/eval-callback/eval-callback.cpp
+index 703ce130b..982fd1601 100644
+--- a/examples/eval-callback/eval-callback.cpp
++++ b/examples/eval-callback/eval-callback.cpp
+@@ -38,8 +38,6 @@ static bool run(llama_context * ctx, const common_params & params) {
+ int main(int argc, char ** argv) {
+     std::setlocale(LC_NUMERIC, "C");
+ 
+-    common_debug_cb_user_data cb_data;
+-
+     common_params params;
+ 
+     common_init();
+@@ -52,8 +50,10 @@ int main(int argc, char ** argv) {
+     llama_numa_init(params.numa);
+ 
+     // pass the callback to the backend scheduler
+-    // it will be executed for each node during the graph computation
+-    params.cb_eval = common_debug_cb_eval;
++    // it will be executed for each node during the graph computation. The
++    // user-data ctor wires up filter regexes, optional NaN abort, and (if
++    // $LLAMA_DUMP_TENSORS_DIR is set) per-tensor .npy dumps.
++    common_debug_cb_user_data cb_data(params, params.tensor_filter, /*abort_on_nan*/ false);
+     params.cb_eval_user_data = &cb_data;
+     params.warmup = false;
+ 
+diff --git a/examples/debug/debug.cpp b/examples/debug/debug.cpp
+index 18a264b63..acbdeb24a 100644
+--- a/examples/debug/debug.cpp
++++ b/examples/debug/debug.cpp
+@@ -187,7 +187,7 @@ static bool run(llama_context * ctx, const common_params & params) {
+ 
+     const bool add_bos = llama_vocab_get_add_bos(vocab);
+ 
+-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos);
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, /*parse_special*/ true);
+ 
+     if (tokens.empty()) {
+         LOG_ERR("%s : there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);

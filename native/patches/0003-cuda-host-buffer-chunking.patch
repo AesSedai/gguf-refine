@@ -1,0 +1,49 @@
+Cap pinned host buffers at 8 GiB (GGML_CUDA_HOST_MAX_BUFFER_SIZE_MB) so one failed cudaMallocHost only
+demotes that chunk to pageable memory instead of the whole host spill.
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a2db28ade..f561f35fc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1768,6 +1768,28 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
+     CUDA_CHECK(cudaFreeHost(buffer->context));
+ }
+ 
++// Pinned host allocations are all-or-nothing: a single failed cudaMallocHost silently
++// degrades the entire buffer to pageable memory. Cap the per-buffer size so that
++// ggml_backend_alloc_ctx_tensors_from_buft splits large weight sets into chunks; then only
++// the chunks that cannot be pinned fall back, instead of every tensor in the context.
++// Note: a single tensor larger than this cap still gets its own (oversized) buffer.
++static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++
++    static size_t max_size = []() -> size_t {
++        const char * val = getenv("GGML_CUDA_HOST_MAX_BUFFER_SIZE_MB");
++        if (val != nullptr) {
++            const size_t mb = (size_t) strtoull(val, nullptr, 10);
++            if (mb > 0) {
++                return mb * 1024 * 1024;
++            }
++        }
++        return (size_t) 8 * 1024 * 1024 * 1024; // 8 GiB
++    }();
++
++    return max_size;
++}
++
+ static void * ggml_cuda_host_malloc(size_t size) {
+     if (ggml_cuda_pinned_memory_disabled()) {
+         return nullptr;
+@@ -1801,12 +1823,6 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
+     return buffer;
+ }
+ 
+-static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+-    GGML_UNUSED(buft);
+-    // very large pinned allocations can fail (e.g. on Windows) and fall back to pageable memory, smaller ones succeed
+-    return 4ull*1024*1024*1024;
+-}
+-
+ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
+         /* .iface    = */ {
