@@ -31,9 +31,9 @@ import numpy as np
 import torch
 
 from ..quant import codes as iq
-from ..quant.kernels import iq as kn
-from ..quant.kernels import parity as kp
-from ..quant.kernels import iq1 as k1
+from ..quant.kernels import free_sign as kn
+from ..quant.kernels import parity_sign as kp
+from ..quant.kernels import ternary as k1
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -179,7 +179,7 @@ class ShadowCheck:
     def after_block(self, Q, DV1, c, GB, margin=None):
         """GB after the launch holds, at each chunk's columns, the fp32 gradient the kernel used at that
         chunk's start. margin_need per moved step = |2 d.(g_kernel - g_exact)| / scale (scale as in
-        kernels.iq._gate): the gate margin that would absorb the gradient error of that step."""
+        kernels.common._gate): the gate margin that would absorb the gradient error of that step."""
         gk = GB[:, self.rows].double()
         v2 = Q[:, self.rows][:, :, c].double()
         v1 = DV1[:, self.rows].double()
@@ -284,7 +284,7 @@ class FastRefiner:
         gate: accept gate (None = on for parity types, off for IQ2_S / IQ3_S); per-sweep
         rejections in self.gate_rejects[e][mat]. shadow: ShadowCheck (parity types only).
         refresh: "fp32" (cuBLAS bmm, default) or "ozaki" (OzakiRefresh: near-exact gradient refresh).
-        flip: IQ1_S only, add the per-sweep delta-flip pass (kernels.iq1._iq1s_flip_kernel); per-sweep counts in
+        flip: IQ1_S only, add the per-sweep delta-flip pass (kernels.ternary._iq1s_flip_kernel); per-sweep counts in
         self.flip_moves[e][mat] (also included in moves).
         schedule: optional callable sw -> (W_sw or None, Hf_sw or None, noisy) giving the target and Hessian that sweep sw
         descends on (None = W / Hf); the gradient refresh at the end of sweep sw-1 is done against sweep sw's target, so a

@@ -1,5 +1,5 @@
 """Triton kernel for batched Hessian codeword refinement of the parity-sign IQ types
-(IQ2_XXS, IQ2_XS, IQ3_XXS) (ggufrefine.refine.engine). Same launch structure as kernels.iq: one
+(IQ2_XXS, IQ2_XS, IQ3_XXS) (ggufrefine.refine.engine). Same launch structure as kernels.free_sign: one
 launch = one block of the per-sweep visiting order, all rows of all E experts, each program owns
 BR rows of one expert and walks the block's NB items sequentially; the caller applies the deferred
 update of the other columns as one batched GEMM per block.
@@ -17,10 +17,10 @@ positions M of the step scores
 and S(u) - S(v) is the exact objective change. Magnitude step: features of U = sig masked to M
 against a codebook of grid vectors placed at M (zeros elsewhere); sign step: U = mu (magnitudes)
 against the 128 legal +-1 patterns. Both are one [BR, 64] x [64, ncand] tl.dot per candidate tile
-(_feat_rows / _feat_codebook from kernels.iq: 36 quadratic + 8 linear feature slots).
+(_feat_rows / _feat_codebook from kernels.common: 36 quadratic + 8 linear feature slots).
 
 Acceptance: (1) the fp32 test of the reference refiners, gain = cur - S_best > tol * |cur|;
-(2) with GATE != 0, kernels.iq._gate: the chosen move's objective change is recomputed in the
+(2) with GATE != 0, kernels.common._gate: the chosen move's objective change is recomputed in the
 direct form delta = d A d - 2 d . g_cur (d = u - v, g_cur = g_B - (v - v_chunk_start) A), which has
 no cancellation against the large v A terms that make the fp32 S values close, and the move is
 kept only if delta < -(margin + arithmetic bound) * scale. GATE=1 evaluates it in fp32 with a
@@ -39,7 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .iq import _feat_codebook, _feat_rows, _gate
+from .common import _argmin_dot, _feat_codebook, _feat_rows, _gate, _quad8
 
 
 def parity_tables(grid, ksigns, dev):
@@ -59,30 +59,6 @@ def parity_tables(grid, ksigns, dev):
                 CBS=_feat_codebook(S).to(dev),
                 GT8=G8.transpose(1, 2).contiguous().float().to(dev),
                 LEG=torch.as_tensor(ksigns.astype(np.int32)).to(dev))
-
-
-@triton.jit
-def _argmin_dot(X, CB, NCAND: tl.constexpr, BC: tl.constexpr, BR: tl.constexpr, PREC: tl.constexpr):
-    """best (value, lowest index) of X [BR, 64] . CB[:, c] over c < NCAND (CB row-major [64, NCAND])"""
-    f64 = tl.arange(0, 64)
-    best_v = tl.full([BR], float("inf"), tl.float32)
-    best_i = tl.zeros([BR], dtype=tl.int32)
-    for c0 in range(0, NCAND, BC):
-        ci = c0 + tl.arange(0, BC)
-        cb = tl.load(CB + f64[:, None] * NCAND + ci[None, :])                 # [64, BC]
-        S = tl.dot(X, cb, input_precision=PREC)
-        tmin = tl.min(S, axis=1)
-        targ = tl.min(tl.where(S == tmin[:, None], ci[None, :], NCAND), axis=1)
-        upd = tmin < best_v
-        best_v = tl.where(upd, tmin, best_v)
-        best_i = tl.where(upd, targ, best_i)
-    return best_v, best_i
-
-
-@triton.jit
-def _quad8(v, A):
-    """v [BR, 8] -> v A v [BR]"""
-    return tl.sum(tl.sum(v[:, :, None] * A[None, :, :], axis=1) * v, axis=1)
 
 
 @triton.jit

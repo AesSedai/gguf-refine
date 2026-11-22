@@ -1,5 +1,5 @@
 """Triton kernel for batched Hessian codeword refinement of IQ1_S / IQ1_M (ggufrefine.refine.engine).
-Launch structure as kernels.parity / kernels.iq: one launch = one block of NB items of the
+Launch structure as kernels.parity_sign / kernels.free_sign: one launch = one block of NB items of the
 per-sweep permutation, all rows of all E experts; each program owns BR rows of one expert and walks
 the block's items sequentially (exact in-block gradient); the caller applies the deferred update
 of the other columns as one batched GEMM per block.
@@ -15,7 +15,7 @@ u = m * (grid[idx] + delta), m = d * (2s+1) fixed per group, delta = +-0.125.
 Both are one [BR, 64] x [64, ncand] tl.dot per candidate tile (_feat_rows / _feat_codebook with
 U = 1: 36 quadratic + 8 linear feature slots), argmin with lowest-index ties.
 Acceptance as the engine's other types: the fp32 test gain = cur - S_best > tol * |cur|, then with
-GATE != 0 kernels.iq._gate (direct-form recheck of the move against the fp32 gradient).
+GATE != 0 kernels.common._gate (direct-form recheck of the move against the fp32 gradient).
 Codes written are always legal (11-bit index, delta bit; IQ1_S keeps the sub-block's delta).
 All search arithmetic FP32 (tl.dot input_precision="ieee": no TF32).
 
@@ -24,7 +24,7 @@ per-sweep permutation of the K/32 sub-blocks, run as a second pass after the gro
 shared delta, re-pick the 4 grid indices greedily in order 0..3 under the new delta (each exhaustive
 over 2048, exact in-item gradient g_B - (v_t - v0) A32), then keep the whole 32-weight move only if
 its direct objective change delta = d A32 d - 2 d.g_B is < -tol * |S(v0)| and, with GATE != 0,
-< -(margin + FLIP_ARITH) * scale (scale as kernels.iq._gate, over the 32 columns; GATE=2 is
+< -(margin + FLIP_ARITH) * scale (scale as kernels.common._gate, over the 32 columns; GATE=2 is
 treated as GATE=1 here: the flip recheck is fp32 with the rounding bound). Same as
 the fp64 reference IQ1Refiner(flip=True).
 """
@@ -35,8 +35,7 @@ import triton.language as tl
 FLIP_ARITH = tl.constexpr(1e-5)   # rounding bound of the fp32 32-wide delta relative to `scale` (~170 u_fp32; two
                       # 32-term dot products + a 32-term sum per chain)
 
-from .parity import _argmin_dot, _quad8
-from .iq import _feat_codebook, _feat_rows, _gate
+from .common import _argmin_dot, _feat_codebook, _feat_rows, _gate, _quad8
 
 
 def iq1_tables(grid, dev):
