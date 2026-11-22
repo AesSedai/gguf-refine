@@ -32,10 +32,10 @@ index 000000000..641cf7b95
 +endif()
 diff --git a/tools/capture/capture.cpp b/tools/capture/capture.cpp
 new file mode 100644
-index 000000000..ff2b3a94a
+index 0000000..8d996dd
 --- /dev/null
 +++ b/tools/capture/capture.cpp
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,191 @@
 +// libllama-capture: a C API for capturing the input activations of every weight matmul from Python.
 +//
 +// The model and context come from llama.cpp's common argument parser (so -m, -c, -b, -ub, -ngl, --fit, -lm,
@@ -199,8 +199,12 @@ index 000000000..ff2b3a94a
 +    }
 +    llama_memory_clear(llama_get_memory(s->ctx), true);
 +    common_batch batch(s->ctx);
++    // equal steps per sequence (n_seq * step <= n_batch): no short tail ubatch, which a min-rows filter would drop
++    const int32_t per     = std::max<int32_t>(1, n_batch / n_seq);
++    const int32_t n_steps = (n_tok + per - 1) / per;
++    const int32_t step0   = (n_tok + n_steps - 1) / n_steps;
 +    for (int32_t p0 = 0; p0 < n_tok; ) {
-+        const int32_t step = std::max<int32_t>(1, std::min<int32_t>(n_tok - p0, n_batch / n_seq));
++        const int32_t step = std::min<int32_t>(n_tok - p0, step0);
 +        batch.clear();
 +        for (int32_t k = 0; k < n_seq; ++k) {
 +            for (int32_t p = p0; p < p0 + step; ++p) {

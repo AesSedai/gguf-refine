@@ -15,3 +15,4 @@ Base: upstream commit in `LLAMA_COMMIT`. `build.sh [SRC_DIR]` clones (or reuses)
 | 0008 convert mxfp4 and writer speed | faster MXFP4 repack / GGUFWriter | building reference GGUFs |
 | 0009 cuda gpu quantizer | `ggml_cuda_quantize_weights`, byte-identical to CPU | refine / errtab (via ctypes) |
 | 0010 capture library | `libllama-capture`: eval-callback access to every weight matmul's input | `ggufrefine.capture.ggml` |
+| 0011 perplexity tokens file | `llama-perplexity --tokens-file`: evaluate / write a KLD base from int32 token ids | eval sets with chat markup (`ggufrefine.corpus`) |

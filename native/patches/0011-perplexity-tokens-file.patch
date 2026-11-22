@@ -1,0 +1,71 @@
+perplexity: --tokens-file, evaluate (and write a KLD base of) given int32 token ids instead of tokenizing -f text.
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 4e031cb7f..2f35749ea 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2499,6 +2499,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.logits_file = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
++    add_opt(common_arg(
++        {"--tokens-file"}, "FNAME",
++        "evaluate these token ids (raw little-endian int32, as numpy's tofile writes them) instead of tokenizing -f; "
++        "chunks are consecutive n_ctx-token slices, the first token of each replaced by BOS when the vocab adds one",
++        [](common_params & params, const std::string & value) {
++            params.tokens_file = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+     add_opt(common_arg(
+         {"--ppl-stride"}, "N",
+         string_format("stride for perplexity calculation (default: %d)", params.ppl_stride),
+diff --git a/common/common.h b/common/common.h
+index e16bee7c1..c674fd92b 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -542,6 +542,7 @@ struct common_params {
+     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
+     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
+     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
++    std::string tokens_file          = ""; // int32 token ids to evaluate instead of tokenizing the prompt   // NOLINT
+     std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
+ 
+     // llama-debug specific options
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 601361acd..901747798 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -439,6 +439,23 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
+     return {tokens, std::exp(nll / count), logit_history, prob_history};
+ }
+ 
++// --tokens-file: raw int32 token ids
++static std::vector<llama_token> read_tokens_file(const std::string & path) {
++    std::ifstream f(path, std::ios::binary | std::ios::ate);
++    if (!f) {
++        throw std::runtime_error("cannot open --tokens-file " + path);
++    }
++    const std::streamsize n = f.tellg();
++    if (n % (std::streamsize) sizeof(llama_token) != 0) {
++        throw std::runtime_error("--tokens-file " + path + ": size is not a multiple of 4");
++    }
++    std::vector<llama_token> tokens(n / sizeof(llama_token));
++    f.seekg(0);
++    f.read(reinterpret_cast<char *>(tokens.data()), n);
++    LOG_INF("%s: %zu tokens from %s\n", __func__, tokens.size(), path.c_str());
++    return tokens;
++}
++
+ static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx) {
+     if (params.ppl_stride > 0) {
+         return perplexity_v2(ctx, params);
+@@ -470,7 +487,8 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+     auto tim1 = std::chrono::high_resolution_clock::now();
+     LOG_INF("%s: tokenizing the input ..\n", __func__);
+ 
+-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
++    std::vector<llama_token> tokens = params.tokens_file.empty() ? common_tokenize(ctx, params.prompt, true)
++                                                                 : read_tokens_file(params.tokens_file);
+ 
+     auto tim2 = std::chrono::high_resolution_clock::now();
+     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
