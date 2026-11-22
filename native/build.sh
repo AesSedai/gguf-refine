@@ -25,6 +25,11 @@ else
     echo "$want" > "$stamp"
 fi
 targets=${TARGETS:-llama-kld-swap llama-perplexity-fast llama-perplexity llama-imatrix llama-eval-callback llama-quantize test-quantize-cuda}
+if [ -z "${CUDACXX:-}" ] && ! command -v nvcc > /dev/null; then
+    for c in "${CUDA_HOME:-}/bin/nvcc" /usr/local/cuda/bin/nvcc; do [ -x "$c" ] && { export CUDACXX=$c; break; }; done
+    [ -n "${CUDACXX:-}" ] || { echo "nvcc not found: put it on PATH or set CUDACXX / CUDA_HOME" >&2; exit 1; }
+    echo "using $CUDACXX"
+fi
 cmake -S "$src" -B "$src/build" -DGGML_CUDA=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA:-}
 cmake --build "$src/build" -j"$(nproc)" --target $targets 2>&1 | tee "$src/build/build.log"
 echo "built into $src/build/bin"
