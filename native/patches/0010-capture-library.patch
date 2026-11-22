@@ -1,0 +1,225 @@
+libllama-capture: a C API (lc_open / lc_decode / lc_tokenize / lc_info / lc_close) over llama.cpp's common setup
+with an eval callback that hands every weight matmul's input (data pointer, type, shape, CUDA ordinal, graph name)
+to the caller. ggufrefine.capture.ggml uses it to accumulate input Grams on the GPU from llama.cpp's own graph.
+
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index c662a9284..11562eee6 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -17,6 +17,7 @@ else()
+     add_subdirectory(batched-bench)
+     add_subdirectory(gguf-split)
+     add_subdirectory(imatrix)
++    add_subdirectory(capture)
+     add_subdirectory(llama-bench)
+     add_subdirectory(completion)
+     add_subdirectory(perplexity)
+diff --git a/tools/capture/CMakeLists.txt b/tools/capture/CMakeLists.txt
+new file mode 100644
+index 000000000..641cf7b95
+--- /dev/null
++++ b/tools/capture/CMakeLists.txt
+@@ -0,0 +1,10 @@
++set(TARGET llama-capture)
++
++add_library(${TARGET} SHARED capture.cpp)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
++set_target_properties(${TARGET} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++
++if(LLAMA_TOOLS_INSTALL)
++    install(TARGETS ${TARGET} LIBRARY)
++endif()
+diff --git a/tools/capture/capture.cpp b/tools/capture/capture.cpp
+new file mode 100644
+index 000000000..ff2b3a94a
+--- /dev/null
++++ b/tools/capture/capture.cpp
+@@ -0,0 +1,187 @@
++// libllama-capture: a C API for capturing the input activations of every weight matmul from Python.
++//
++// The model and context come from llama.cpp's common argument parser (so -m, -c, -b, -ub, -ngl, --fit, -lm,
++// -fa, -np, --kv-unified and tensor overrides all apply), with an eval callback that hands each MUL_MAT /
++// MUL_MAT_ID input to the caller: the weight name, the op, and the input tensor (and the expert ids for
++// MUL_MAT_ID) as data pointer + type + ne/nb + device (-1 host memory, n >= 0 CUDA ordinal, -2 other). The
++// pointer is valid only during the callback; the caller must finish (and synchronise) any work on it first.
++//
++//   lc_open(argc, argv, cb, user) -> handle        lc_decode(h, tokens, n_seq, n_tok) evaluates n_seq sequences
++//   lc_info / lc_tokenize / lc_close                of n_tok tokens each (memory cleared first, every token output)
++
++#include "arg.h"
++#include "common.h"
++#include "llama.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <vector>
++
++extern "C" {
++
++typedef struct {
++    void *   data;
++    int32_t  type;      // ggml_type
++    int32_t  device;    // -1 host memory, n >= 0 CUDA ordinal, -2 another device type
++    int64_t  ne[4];
++    uint64_t nb[4];
++    char     name[64];  // graph name of the tensor (e.g. attn_norm-0): unique per layer, unlike data
++} lc_tensor;
++
++#define LC_MUL_MAT    0
++#define LC_MUL_MAT_ID 1
++
++// ask = 1: return nonzero to receive the data of this node; ask = 0: data call, return value ignored (nonzero = continue)
++typedef int (*lc_cb)(void * user, const char * weight, int32_t op, int32_t ask, const lc_tensor * x, const lc_tensor * ids);
++
++void *  lc_open    (int argc, char ** argv, lc_cb cb, void * user);
++int     lc_info    (void * h, int32_t * out);
++int64_t lc_tokenize(void * h, const char * text, int32_t * out, int64_t max);
++int     lc_decode  (void * h, const int32_t * tokens, int32_t n_seq, int32_t n_tok);
++void    lc_close   (void * h);
++
++}
++
++struct lc_state {
++    common_params                 params;
++    common_init_result_ptr        init;
++    llama_context *               ctx   = nullptr;
++    const llama_vocab *           vocab = nullptr;
++    lc_cb                         cb    = nullptr;
++    void *                        user  = nullptr;
++};
++
++static int32_t device_of(const ggml_tensor * t) {
++    if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
++        return -1;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
++    const char * name = dev ? ggml_backend_dev_name(dev) : "";
++    int idx = -1;
++    if (std::sscanf(name, "CUDA%d", &idx) == 1 && idx >= 0) {
++        return idx;
++    }
++    return -2;  // another device type: the caller cannot read it
++}
++
++static void fill(lc_tensor & o, const ggml_tensor * t) {
++    o.data = t->data;
++    o.type = t->type;
++    o.device = device_of(t);
++    for (int i = 0; i < 4; ++i) {
++        o.ne[i] = t->ne[i];
++        o.nb[i] = t->nb[i];
++    }
++    std::snprintf(o.name, sizeof(o.name), "%s", t->name);
++}
++
++static bool lc_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * s = (lc_state *) user_data;
++    if (t->op != GGML_OP_MUL_MAT && t->op != GGML_OP_MUL_MAT_ID) {
++        return ask ? false : true;
++    }
++    const ggml_tensor * w = t->src[0];
++    const ggml_tensor * x = t->src[1];
++    if (w == nullptr || x == nullptr || w->name[0] == '\0' || w->name[0] == '(') {
++        return ask ? false : true;   // not a named model weight (views, intermediate products)
++    }
++    lc_tensor xt{}, it{};
++    fill(xt, x);
++    const bool has_ids = t->op == GGML_OP_MUL_MAT_ID && t->src[2] != nullptr;
++    if (has_ids) {
++        fill(it, t->src[2]);
++    }
++    if (ask) {
++        xt.data = nullptr;
++        it.data = nullptr;
++    }
++    const int r = s->cb(s->user, w->name, t->op == GGML_OP_MUL_MAT ? LC_MUL_MAT : LC_MUL_MAT_ID, ask ? 1 : 0, &xt, has_ids ? &it : nullptr);
++    return ask ? r != 0 : true;
++}
++
++extern "C" {
++
++void * lc_open(int argc, char ** argv, lc_cb cb, void * user) {
++    auto s = std::make_unique<lc_state>();
++    common_init();
++    if (!common_params_parse(argc, argv, s->params, LLAMA_EXAMPLE_PERPLEXITY)) {
++        return nullptr;
++    }
++    llama_backend_init();
++    llama_numa_init(s->params.numa);
++    s->cb   = cb;
++    s->user = user;
++    s->params.cb_eval           = lc_eval_cb;
++    s->params.cb_eval_user_data = s.get();
++    s->params.warmup            = false;
++    s->init = common_init_from_params(s->params);
++    if (s->init->model() == nullptr || s->init->context() == nullptr) {
++        return nullptr;
++    }
++    s->ctx   = s->init->context();
++    s->vocab = llama_model_get_vocab(s->init->model());
++    return s.release();
++}
++
++// n_ctx, n_batch, n_ubatch, n_seq_max, n_vocab, add_bos
++int lc_info(void * h, int32_t * out) {
++    auto * s = (lc_state *) h;
++    out[0] = (int32_t) llama_n_ctx(s->ctx);
++    out[1] = (int32_t) llama_n_batch(s->ctx);
++    out[2] = (int32_t) llama_n_ubatch(s->ctx);
++    out[3] = (int32_t) llama_n_seq_max(s->ctx);
++    out[4] = llama_vocab_n_tokens(s->vocab);
++    out[5] = llama_vocab_get_add_bos(s->vocab) ? 1 : 0;
++    return 0;
++}
++
++// tokenizes text as llama-imatrix / llama-perplexity do (BOS per the vocab, special tokens parsed);
++// returns the token count, or -count if max is too small (nothing written then)
++int64_t lc_tokenize(void * h, const char * text, int32_t * out, int64_t max) {
++    auto * s = (lc_state *) h;
++    std::vector<llama_token> t = common_tokenize(s->ctx, std::string(text), true, true);
++    if ((int64_t) t.size() > max) {
++        return -(int64_t) t.size();
++    }
++    std::memcpy(out, t.data(), t.size() * sizeof(int32_t));
++    return (int64_t) t.size();
++}
++
++// n_seq sequences of n_tok tokens (row-major), sequence k = seq id k, positions 0..n_tok-1; every token is an
++// output so that the last layer runs on all of them. Returns 0 on success.
++int lc_decode(void * h, const int32_t * tokens, int32_t n_seq, int32_t n_tok) {
++    auto * s = (lc_state *) h;
++    const int32_t n_batch = (int32_t) llama_n_batch(s->ctx);
++    if (n_seq > (int32_t) llama_n_seq_max(s->ctx) || (int64_t) n_tok * n_seq > (int64_t) llama_n_ctx(s->ctx)) {
++        return 2;
++    }
++    llama_memory_clear(llama_get_memory(s->ctx), true);
++    common_batch batch(s->ctx);
++    for (int32_t p0 = 0; p0 < n_tok; ) {
++        const int32_t step = std::max<int32_t>(1, std::min<int32_t>(n_tok - p0, n_batch / n_seq));
++        batch.clear();
++        for (int32_t k = 0; k < n_seq; ++k) {
++            for (int32_t p = p0; p < p0 + step; ++p) {
++                batch.add(tokens[(int64_t) k * n_tok + p], p, k, true);
++            }
++        }
++        if (llama_process(s->ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++            return 1;
++        }
++        p0 += step;
++    }
++    llama_synchronize(s->ctx);
++    return 0;
++}
++
++void lc_close(void * h) {
++    auto * s = (lc_state *) h;
++    delete s;
++    llama_backend_free();
++}
++
++}

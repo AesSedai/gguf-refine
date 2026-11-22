@@ -20,11 +20,16 @@ codecs, planning, patching and the CPU tests do not.
 
 ## Pipeline
 
-1. **Capture**: per-expert (or per-matrix) input activations on calibration text, held out by part.
-   `models/kimi_k3/capture/capture.sh` (fp32 PyTorch forward, one process per GPU).
+1. **Capture**: input Grams of every weight matmul on calibration text, held out by part.
+   - Any model llama.cpp runs with its layers in VRAM: `python -m ggufrefine.capture.ggml` evaluates llama.cpp's own
+     graph (libllama-capture, native patch 0010) and accumulates the Grams on the GPUs from its buffers, then
+     `python -m ggufrefine.capture.merge_grams` builds the train / test splits. `capture.hf` is an fp32 transformers
+     reference for checking a capture (`capture.compare`).
+   - Kimi-K3.1 (1.56 TB reference, larger than VRAM + RAM): `models/kimi_k3/capture/capture.sh`, a layer-major fp32
+     PyTorch forward that dumps the routed-expert inputs.
 2. **Refine**: per group of tensors sharing one input, Hessians from the capture, stock codes from the quantizer +
    imatrix, coordinate descent on the codewords; codes written straight into a stock GGUF of the same recipe.
-   `models/kimi_k3/refine_all.sh TYPE TARGET.gguf`.
+   Dense / ggml-captured models: `python -m ggufrefine.models.dense`; K3.1: `models/kimi_k3/refine_all.sh TYPE TARGET.gguf`.
 3. **Plan** (optional): held-out error per (layer, role, type) on a stratified expert sample (`errtab_all.sh`), then an
    exact knapsack over types under a byte budget (`python -m ggufrefine.alloc.plan`).
 4. **Evaluate**: `models/kimi_k3/matched_eval.sh` builds the stock file with the same recipe, checks that it differs
@@ -42,9 +47,10 @@ Each script lists its environment variables (model directory, capture root, imat
 | `ggufrefine/quant/` | IQ block codecs (`codes.py`); Triton kernels per codebook family (`kernels/`); ggml quantizer via ctypes |
 | `ggufrefine/ggufio.py` | tensor table, per-expert reads, dequantized weights, imatrix rows, verified in-place writes |
 | `ggufrefine/fold.py`, `patch.py` | fold `<tensor>-e<E>.npy` outputs into a GGUF in place; in-place patch with backup / revert |
-| `ggufrefine/capture/` | dense-matmul Gram storage format and the per-process Gram merger |
+| `ggufrefine/capture/` | Gram storage format and merger; ggml-graph capture (`ggml.py`), fp32 transformers reference (`hf.py`), capture comparison (`compare.py`) |
 | `ggufrefine/alloc/` | error tables (`errtab.py`), stratified estimates + type plan (`plan.py`), exact knapsack (`knapsack.py`) |
 | `ggufrefine/eval/` | llama-kld-swap client (`kldswap.py`), multi-base runner (`kld.py`), calibration-overlap split (`overlap.py`), sensitivity probes (`probe.py`), build check (`check_build.py`) |
+| `ggufrefine/models/dense.py` | groups and Hessians from merged Gram splits, weights from a reference GGUF: any ggml-captured model |
 | `ggufrefine/models/kimi_k3/` | K3.1 adapter: groups and plan config, MXFP4 safetensors weights, Hessians from the expert dump (`expert_dump.py`), capture (`capture/`), CLIs and run scripts |
 | `native/` | llama.cpp patch series on `native/LLAMA_COMMIT` and its build script |
 | `tests/` | `test_cpu.py` (no GPU); `gpu/` (engine vs fp64 references, needs CUDA); `test_k31_data.py`, `acceptance_k31.py` (need K3.1 files, see below) |

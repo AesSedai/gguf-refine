@@ -35,6 +35,7 @@ class Settings:
     lam: float = 1.0
     hessian: str = "full"            # full | diag
     sweeps: int = 8
+    seed: int = 0                    # visit-order seed of the refiner (record it in tag when not 0)
     noise: str = ""                  # "SCALE:NOISY:CLEAN" annealed target noise, for the groups in noise_groups
     noise_groups: tuple = ()
     gate: str = "auto"               # auto | on | exact | off
@@ -307,7 +308,7 @@ def refine_layer(layer, groups, types, weights, hessians, stock, settings, resul
                     return W + sig[:, None, None] * torch.randn(W.shape, device=W.device, generator=gen), None, True
             flip = t == "IQ1_S" and s.iq1s_flip
             gl = _gate_level(s, t)
-            Q1, moves, obj_log = rf.run(W, Hf, mult, code, len(g.tensors), sweeps=sweeps_g, gate=gl, margin=s.gate_margin,
+            Q1, moves, obj_log = rf.run(W, Hf, mult, code, len(g.tensors), sweeps=sweeps_g, seed=s.seed, gate=gl, margin=s.gate_margin,
                                         shadow=sh, refresh=s.refresh, **({"flip": True} if flip else {}),
                                         **({"schedule": sched} if sched else {}))
             if sh is not None:

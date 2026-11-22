@@ -24,7 +24,7 @@ else
     done
     echo "$want" > "$stamp"
 fi
-targets=${TARGETS:-llama-kld-swap llama-perplexity-fast llama-perplexity llama-imatrix llama-eval-callback llama-quantize test-quantize-cuda}
+targets=${TARGETS:-llama-kld-swap llama-perplexity-fast llama-perplexity llama-imatrix llama-eval-callback llama-quantize llama-tokenize llama-capture test-quantize-cuda}
 if [ -z "${CUDACXX:-}" ] && ! command -v nvcc > /dev/null; then
     for c in "${CUDA_HOME:-}/bin/nvcc" /usr/local/cuda/bin/nvcc; do [ -x "$c" ] && { export CUDACXX=$c; break; }; done
     [ -n "${CUDACXX:-}" ] || { echo "nvcc not found: put it on PATH or set CUDACXX / CUDA_HOME" >&2; exit 1; }
