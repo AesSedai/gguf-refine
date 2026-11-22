@@ -26,7 +26,9 @@ codecs, planning, patching and the CPU tests do not.
      `python -m ggufrefine.capture.merge_grams` builds the train / test splits. `capture.hf` is an fp32 transformers
      reference for checking a capture (`capture.compare`).
    - Kimi-K3.1 (1.56 TB reference, larger than VRAM + RAM): `models/kimi_k3/capture/capture.sh`, a layer-major fp32
-     PyTorch forward that dumps the routed-expert inputs.
+     PyTorch forward that dumps the routed-expert inputs. It streams each layer's weights once per round of tokens;
+     llama.cpp runs every ubatch through all layers, so the weights that overflow VRAM are re-read per ubatch (measured:
+     one 65k-token batch did not finish in 84 min, against 6 h for the whole 2.5M-token capture layer-major).
 2. **Refine**: per group of tensors sharing one input, Hessians from the capture, stock codes from the quantizer +
    imatrix, coordinate descent on the codewords; codes written straight into a stock GGUF of the same recipe.
    Dense / ggml-captured models: `python -m ggufrefine.models.dense`; K3.1: `models/kimi_k3/refine_all.sh TYPE TARGET.gguf`.
