@@ -2,11 +2,13 @@
 weights from a GGUF of the reference precision, stock codes from the quantizer + imatrix.
 
 Groups: each Gram input group (tensors that read one input) becomes one refine group when its tensors have equal row
-counts (gate + up), else one group per tensor sharing that Hessian (q / k / v). Hessians: H = sum_t x_t x_t^T of the
+counts and types (gate + up), else one group per tensor sharing that Hessian (q / k / v).
+Types: without --type / --types, each tensor keeps the type the stock --write-gguf file has (a llama-quantize preset
+mixes types); tensors whose type is not refinable (Q4_K, Q6_K, ...) are left as they are. Hessians: H = sum_t x_t x_t^T of the
 train and test splits (<grams>/{train,test}/layer-<L>/). A layer is refined in one driver call.
 
-    python -m ggufrefine.models.dense --gguf BF16.gguf --grams GRAMS --imatrix X.imatrix.gguf --type IQ2_XS \\
-        --write-gguf STOCK-IQ2_XS.gguf --results logs/refine.jsonl [--layers 0-47] [--only attn_q,ffn_down]
+    python -m ggufrefine.models.dense --gguf BF16.gguf --grams GRAMS --imatrix X.imatrix.gguf \\
+        --write-gguf COPY-OF-STOCK.gguf --results logs/refine.jsonl [--layers 0-47] [--only attn_q,ffn_down]
 """
 import argparse
 import json
@@ -21,6 +23,7 @@ import torch
 from .. import ggufio
 from ..capture.grams import tri_len, unpack_tri
 from ..refine import driver
+from ..refine import engine
 from ..refine.problem import Group, RequantizedCodes
 
 
@@ -57,15 +60,19 @@ class GramSplits:
         return self.cache[g]
 
 
-def groups(layer, splits, info, only=None):
-    """-> ([Group], {group key: Gram group name})"""
+REFINABLE = ("IQ2_S", "IQ3_S") + tuple(engine.GATED)
+
+
+def groups(layer, splits, info, only=None, type_of=None):
+    """-> ([Group], {group key: Gram group name}); type_of(name) -> type, or None to leave the tensor out"""
     out, src = [], {}
     for g, m in splits.meta(layer)["groups"].items():
-        names = [n for n in m["weights"] if only is None or role(n) in only]
+        names = [n for n in m["weights"] if (only is None or role(n) in only) and (type_of is None or type_of(n))]
         if not names:
             continue
         rows = [info[n].rows for n in names]
-        parts = [names] if len(set(rows)) == 1 else [[n] for n in names]
+        same = len(set(rows)) == 1 and (type_of is None or len({type_of(n) for n in names}) == 1)
+        parts = [names] if same else [[n] for n in names]
         for p in parts:
             key = "+".join(role(n) for n in p)
             out.append(Group(layer, key, tuple(p), 1, m["K"], tuple(info[n].rows for n in p), len(out)))
@@ -99,7 +106,7 @@ def main(argv=None):
     ap.add_argument("--gguf", type=Path, required=True, help="reference-precision GGUF (BF16 / F16 / F32)")
     ap.add_argument("--grams", type=Path, required=True, help="merge_grams output (train / test splits)")
     ap.add_argument("--imatrix", type=Path, required=True, help="the imatrix the stock file was quantized with")
-    ap.add_argument("--type", default=None, help="one type for every refined tensor")
+    ap.add_argument("--type", default=None, help="one type for every refined tensor (default: each tensor's stock type)")
     ap.add_argument("--types", default="", help="per role, e.g. attn_q=IQ2_XS,ffn_down=IQ3_XXS (overrides --type)")
     ap.add_argument("--only", default="", help="comma list of roles to refine (default: all captured)")
     ap.add_argument("--layers", default="", help="e.g. 0-47 (default: every captured layer)")
@@ -115,6 +122,17 @@ def main(argv=None):
     splits = GramSplits(a.grams)
     only = set(a.only.split(",")) if a.only else None
     per_role = dict(kv.split("=") for kv in a.types.split(",")) if a.types else {}
+    if a.type or per_role:
+        def type_of(n):
+            return per_role.get(role(n), a.type)
+    else:
+        if not a.write_gguf:
+            ap.error("without --type / --types the types come from the stock --write-gguf file")
+        stock_types = {n: ti.type for n, ti in ggufio.tensor_table(a.write_gguf).items()}
+
+        def type_of(n):
+            t = stock_types.get(n)
+            return t if t in REFINABLE else None
     weights = GgufWeights(a.gguf)
     stock = RequantizedCodes(weights, ggufio.Imatrix(a.imatrix), a.quant_threads)
     sink = driver.GgufSink(a.write_gguf) if a.write_gguf else (driver.NpySink(a.out) if a.out else None)
@@ -125,10 +143,13 @@ def main(argv=None):
         layers = [L for L in layers if lo <= L <= hi]
     t0 = time.time()
     for i, L in enumerate(layers):
-        gs, src = groups(L, splits, info, only)
+        gs, src = groups(L, splits, info, only, type_of)
+        if not gs:
+            print(f"layer {L}: nothing to refine", flush=True)
+            continue
         types = {}
         for g in gs:
-            t = {per_role.get(role(n), a.type) for n in g.tensors}
+            t = {type_of(n) for n in g.tensors}
             if len(t) != 1 or None in t:
                 ap.error(f"{g.key}: no single type ({t}); give --type or --types for every role")
             types[g.key] = t.pop()

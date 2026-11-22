@@ -20,6 +20,9 @@ codecs, planning, patching and the CPU tests do not.
 
 ## Pipeline
 
+`docs/runbook.md` walks a model end to end (`examples/run_dense.sh`: BF16 -> imatrix -> corpus -> capture -> stock and
+refined quant -> KLD report), with a measured Qwen3.5-9B IQ3_XXS run.
+
 1. **Capture**: input Grams of every weight matmul on calibration text, held out by part.
    - Any model llama.cpp runs with its layers in VRAM: `python -m ggufrefine.capture.ggml` evaluates llama.cpp's own
      graph (libllama-capture, native patch 0010) and accumulates the Grams on the GPUs from its buffers, then
@@ -51,7 +54,10 @@ Each script lists its environment variables (model directory, capture root, imat
 | `ggufrefine/fold.py`, `patch.py` | fold `<tensor>-e<E>.npy` outputs into a GGUF in place; in-place patch with backup / revert |
 | `ggufrefine/capture/` | Gram storage format and merger; ggml-graph capture (`ggml.py`), fp32 transformers reference (`hf.py`), capture comparison (`compare.py`) |
 | `ggufrefine/alloc/` | error tables (`errtab.py`), stratified estimates + type plan (`plan.py`), exact knapsack (`knapsack.py`) |
-| `ggufrefine/eval/` | llama-kld-swap client (`kldswap.py`), multi-base runner (`kld.py`), calibration-overlap split (`overlap.py`), sensitivity probes (`probe.py`), build check (`check_build.py`) |
+| `ggufrefine/corpus.py` | calibration corpus from a JSON spec: train / test / eval split by group before packing, held-out runs shared with train or the imatrix text cut out |
+| `ggufrefine/eval/` | llama-kld-swap client (`kldswap.py`), multi-base runner (`kld.py`), per-domain paired report (`report.py`), calibration-overlap split (`overlap.py`), sensitivity probes (`probe.py`), build check (`check_build.py`) |
+| `examples/` | `run_dense.sh` (the runbook's pipeline), `corpus-mix.json` (the 2.5M-token calibration mix) |
+| `docs/runbook.md` | end-to-end procedure, checks, model notes, measured run |
 | `ggufrefine/models/dense.py` | groups and Hessians from merged Gram splits, weights from a reference GGUF: any ggml-captured model |
 | `ggufrefine/models/kimi_k3/` | K3.1 adapter: groups and plan config, MXFP4 safetensors weights, Hessians from the expert dump (`expert_dump.py`), capture (`capture/`), CLIs and run scripts |
 | `native/` | llama.cpp patch series on `native/LLAMA_COMMIT` and its build script |

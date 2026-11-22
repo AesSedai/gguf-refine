@@ -17,7 +17,7 @@ os.environ["GGUF_REFINE_GPUQ"] = "0"                                          # 
 
 import numpy as np  # noqa: E402
 
-from ggufrefine import ggufio, fold  # noqa: E402
+from ggufrefine import corpus, ggufio, fold  # noqa: E402
 from ggufrefine.alloc import knapsack  # noqa: E402
 from ggufrefine.eval import overlap  # noqa: E402
 from ggufrefine.quant import codes as iq, ggml as gq  # noqa: E402
@@ -269,6 +269,45 @@ class Overlap(unittest.TestCase):
         m = overlap.scored_mask(hits, 64, 512, 256)
         self.assertEqual(m.shape, (2, 255))
         self.assertEqual(m.sum(), 0)                                          # window 2 lies before the scored half
+
+
+class Corpus(unittest.TestCase):
+    """the leak checks of ggufrefine.corpus: window hashes, exposure cuts, grouping, allocation"""
+
+    def test_window_hashes_match_brute_force(self):
+        rng = np.random.default_rng(0)
+        a = rng.integers(0, 50, 400).tolist()
+        h = corpus.window_hashes(a, 8)
+        self.assertEqual(len(h), len(a) - 7)
+        seen = {}
+        for i in range(len(a) - 7):
+            w = tuple(a[i:i + 8])
+            if w in seen:
+                self.assertEqual(h[i], h[seen[w]])
+            seen.setdefault(w, i)
+        self.assertEqual(len(set(h.tolist())), len(seen))                    # distinct windows, distinct hashes
+
+    def test_cut_removes_exactly_the_shared_run(self):
+        rng = np.random.default_rng(1)
+        train = rng.integers(0, 1000, 5000).tolist()
+        doc = rng.integers(0, 1000, 600).tolist()
+        doc[100:200] = train[2000:2100]
+        doc[400:450] = train[3000:3050]                                        # shorter than the window: kept
+        ex = corpus.Exposure(64)
+        ex.add(train)
+        ex.freeze()
+        pieces, cut = ex.cut(doc)
+        self.assertEqual(cut, 100)
+        self.assertEqual([len(p) for p in pieces], [100, 400])
+        for p in pieces:
+            self.assertFalse(ex.mask(p).any())
+
+    def test_character_groups_and_allocation(self):
+        self.assertEqual(corpus._st_character("Dave3"), "dave")
+        self.assertEqual(corpus._st_character("Dave & Erin"), "dave & erin")
+        a = corpus.allocate({"a": 0.9, "b": 0.08, "c": 0.02}, 10, {"c": 2})
+        self.assertEqual(sum(a.values()), 10)
+        self.assertGreaterEqual(a["c"], 2)
 
 
 if __name__ == "__main__":
