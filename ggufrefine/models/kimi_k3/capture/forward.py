@@ -749,7 +749,7 @@ def main():
     def save_grams(name):
         fl = GR.flush()
         meta = dict(gram_meta, saved=time.strftime("%Y-%m-%d %H:%M:%S"))
-        job = lambda: gram_io.write_layer(gram_dir, name, fl, meta, a.gram_reserve_gb)
+        job = lambda: gram_io.write_layer(gram_dir, name, fl, meta, a.gram_reserve_gb, wait=True)   # merge_grams --watch --delete frees space
         if RT["writer"] is not None:
             RT["writer"].submit(job)
         else:

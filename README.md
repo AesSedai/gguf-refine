@@ -11,7 +11,7 @@ calibration text); wiki.test.raw mean KLD unchanged.
 ## Setup
 
     native/build.sh                                   # clone llama.cpp at native/LLAMA_COMMIT, apply native/patches, CUDA build
-    python -m venv .venv && .venv/bin/pip install -e '.[kimi]'
+    python -m venv .venv && .venv/bin/pip install -e .
     .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
 
 The package reads GGUFs with `native/llama.cpp/gguf-py` and loads the ggml quantizer from `native/llama.cpp/build/bin`
@@ -32,8 +32,9 @@ refined quant -> KLD report), with a measured Qwen3.5-9B IQ3_XXS run.
      PyTorch forward that dumps the routed-expert inputs. It streams each layer's weights once per round of tokens;
      llama.cpp runs every ubatch through all layers, so the weights that overflow VRAM are re-read per ubatch (measured:
      one 65k-token batch did not finish in 84 min, against 6 h for the whole 2.5M-token capture layer-major).
-2. **Refine**: per group of tensors sharing one input, Hessians from the capture, stock codes from the quantizer +
-   imatrix, coordinate descent on the codewords; codes written straight into a stock GGUF of the same recipe.
+2. **Refine**: per group of tensors sharing one input, Hessians from the capture, stock codes from the stock GGUF
+   (dense) or the quantizer + imatrix (K3.1), coordinate descent on the codewords; codes written straight into a copy
+   of the stock GGUF.
    Dense / ggml-captured models: `python -m ggufrefine.models.dense`; K3.1: `models/kimi_k3/refine_all.sh TYPE TARGET.gguf`.
 3. **Plan** (optional): held-out error per (layer, role, type) on a stratified expert sample (`errtab_all.sh`), then an
    exact knapsack over types under a byte budget (`python -m ggufrefine.alloc.plan`).

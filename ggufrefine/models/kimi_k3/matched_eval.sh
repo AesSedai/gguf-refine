@@ -4,7 +4,7 @@
 # then score it on the same KLD bases with the same settings.
 #   matched_eval.sh REFINED.gguf STOCK_OUT.gguf KLD_OUT_DIR     env (required): BASES ("name=path ..."), SRC, IMATRIX
 #   (optional): PY
-set -u
+set -uo pipefail
 REFINED=$1; STOCK=$2; KOUT=$3
 cd "$(dirname "$0")/../../.."
 PY=${PY:-python3}
@@ -18,5 +18,5 @@ CUDA_VISIBLE_DEVICES=0 $PY -u -m ggufrefine.eval.check_build --a "$STOCK" --b "$
   --reference "$SRC" --imatrix "$IMATRIX" --sample "${SAMPLE%,}" 2>&1 | tee logs/check-$(basename "$STOCK" .gguf).log
 grep -q "CHECK PASSED" logs/check-$(basename "$STOCK" .gguf).log || { echo "check FAILED, not running KLD"; exit 1; }
 args=(); for b in $BASES; do args+=(--base "$b"); done
-$PY -u -m ggufrefine.eval.kld --gguf "$STOCK" --out "$KOUT" "${args[@]}" 2>&1 | tee "$KOUT/driver.log"
+$PY -u -m ggufrefine.eval.kld --gguf "$STOCK" --out "$KOUT" "${args[@]}" 2>&1 | tee "$KOUT/driver.log" || { echo "kld FAILED"; exit 1; }
 echo "[$(date +%T)] all done"

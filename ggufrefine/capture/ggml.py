@@ -211,8 +211,14 @@ def main(argv=None):
               f"gram {lc.gemm_s:.0f}s of {el:.0f}s  eta {el / done * (toks.shape[0] - done) / 60:.1f} min", flush=True)
     meta = {"part": a.part_id, "seqs": [s0, s1], "n_ctx": int(toks.shape[1]), "tokens_file": str(a.tokens.resolve()),
             "capture": "llama.cpp graph (ggufrefine.capture.ggml)", "llama_args": llama}
-    for layer, fl in lc.flush().items():
-        gram_io.write_layer(a.out, layer, fl, dict(meta, saved=time.strftime("%Y-%m-%d %H:%M:%S")), a.reserve_gb)
+    print(f"[{time.strftime('%H:%M:%S')}] forward done; writing Grams to {a.out}", flush=True)
+    flushed = lc.flush()
+    t1, nbytes = time.time(), 0
+    for j, (layer, fl) in enumerate(flushed.items()):
+        nbytes += gram_io.write_layer(a.out, layer, fl, dict(meta, saved=time.strftime("%Y-%m-%d %H:%M:%S")), a.reserve_gb)[0]
+        el = time.time() - t1
+        print(f"[{time.strftime('%H:%M:%S')}] wrote layer {layer} ({j + 1}/{len(flushed)}, {nbytes / 1e9:.1f} GB, "
+              f"{nbytes / 1e6 / max(el, 1e-3):.0f} MB/s, eta {el / (j + 1) * (len(flushed) - j - 1) / 60:.1f} min)", flush=True)
     lc.close()
     print(f"[{time.strftime('%H:%M:%S')}] done in {(time.time() - t0) / 60:.1f} min -> {a.out}", flush=True)
     return 0

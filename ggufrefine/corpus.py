@@ -1,19 +1,28 @@
 """Calibration corpus with leak-free held-out splits, from a JSON spec of document sources.
 
-Splits: `train` (the Hessians), `test` (held-out Grams: lambda selection, held-out error) and `eval` (the KLD base).
-Leakage is prevented at three levels:
+Splits: `train` (the Hessians), `test` (held-out Grams: the held-out reconstruction error in the refine logs) and
+`eval` (the KLD base). Leakage is prevented at three levels:
   1. Documents are assigned to splits by GROUP before packing (a group is whatever must not straddle the split: a
      role-play character, a shared system prompt / character card, by default the document itself), and each split
-     is packed separately, so no document crosses a split.
+     is packed separately, so no document crosses a split. Group keys are global: the same key in two domains is one
+     group, in one split.
   2. Every held-out token that lies in a `window`-token run (default 64) also present anywhere in train, or in an
      `exclude` text (e.g. the imatrix calibration file), is cut out of its document; the rest of the document stays.
   3. The manifest records per split and domain the groups, documents, tokens and cut fraction, and the token sha256.
 Packing: documents of one domain are concatenated (truncated to `max_doc` tokens) and cut into n_ctx sequences; a
-sequence never mixes domains, so per-chunk KLD can be reported by domain. With the tokenizer's add_bos, the first
-token of every sequence is BOS (as llama-imatrix / llama-perplexity do per chunk).
+sequence never mixes domains, so per-chunk KLD can be reported by domain. Domains are labels for allocation and
+reporting; nothing requires particular names. When llama.cpp adds BOS (the GGUF's tokenizer.ggml.add_bos_token, or
+the spec's "bos" when the GGUF has no such key) the first token of every sequence is BOS, as llama-imatrix /
+llama-perplexity do per chunk.
+
+Strictness: a row that lacks a field its templates use, has an unknown role, malformed tool-call arguments, or fails
+to render with the chat template stops the build (domain, row id, reason), unless the domain sets
+"skip_bad_rows": true; skipped rows are counted in the manifest. A held-out split that ends up with fewer sequences
+than allocated (after cutting exposed runs) stops the build; raise "heldout_margin" (default 1.6: held-out tokens
+collected per needed token) or add held-out data.
 
 Spec (paths may use $VARS):
-  {"n_ctx": 8192, "max_doc": 3000, "seed": 1, "window": 64,
+  {"n_ctx": 8192, "max_doc": 3000, "seed": 1, "window": 64, "bos": null,
    "sequences": {"train": 305, "test": 24, "eval": 32},
    "exclude": ["$KLD/calibration_datav5.txt"],
    "chat_kwargs": {},
@@ -21,21 +30,27 @@ Spec (paths may use $VARS):
      "<name>": {"weight": 0.12, "format": "<format>", "files": "<glob>", ...format fields...,
                 "group": "<format string over the row>", "splits": ["train", "test", "eval"],
                 "min_heldout": 2, "rows_per_file": 400, "max_doc": 3000, "window": "head" | "middle",
-                "chat_kwargs": {"enable_thinking": true}, "replace": {"-": "<content for a turn that is exactly '-'>"}}}}
-Formats (fields are str.format templates over a row; "{a[0][b]}" indexes nested values):
+                "chat_kwargs": {"enable_thinking": true}, "replace": {"-": "<content for a turn that is exactly '-'>"},
+                "roles": {"observation": "user"}, "skip_bad_rows": false}}}
+Formats (fields are str.format templates over a row; "{a[0][b]}" indexes nested values; a null field renders as ""):
   text       "text": "{text}"
   chat       "turns": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "...",
              "reasoning_content": "..."}], "split_think": true (assistant "<think>R</think>A" -> reasoning R)
-  sharegpt   "field": "conversations" (from/value or role/content), optional "append": [turn templates]
+  sharegpt   "field": "conversations" (from/value or role/content), optional "append": [turn templates]; roles
+             system, human/user, gpt/assistant/model, function_call (-> assistant), observation/tool (-> tool);
+             "roles" maps others, or remaps (e.g. tool -> user for a template without a tool role)
   messages   "field": "trajectory" (role/content dicts, JSON or Python literal), optional "tools": "<field>"
   sillytavern  SillyTavern chat exports (<character>/<chat>.jsonl); the group defaults to the character directory
              (trailing digits dropped: Dave, Dave1 and Dave2 are one group, so a chat's branches never straddle splits)
   text_file  one text file cut into n_ctx-token documents ("splits": ["train"] for an imatrix file reused in train)
-Sequences per split are allocated over domains by weight (largest remainder); `min_heldout` raises a domain's
-test / eval share. `splits` restricts a domain (e.g. a held-out-only source).
+Sequences per split are allocated over domains by weight (largest remainder); `min_heldout` sets a minimum of a
+domain's test / eval sequences (taken from the largest other domains). `splits` restricts a domain (e.g. a
+held-out-only source).
 
-    python -m ggufrefine.corpus --spec corpus.json --tokenizer HF_DIR --out DIR
-writes DIR/{train,test,eval}.tokens.npy, DIR/eval.txt (for llama-perplexity, see the runbook), DIR/manifest.json.
+    python -m ggufrefine.corpus --spec corpus.json --check                      # spec, files and allocation only
+    python -m ggufrefine.corpus --spec corpus.json --tokenizer HF_DIR --gguf MODEL.gguf --out DIR [--n-ctx N]
+writes DIR/{train,test,eval}.tokens.npy, DIR/eval.txt, DIR/manifest.json (written last; its presence marks a
+complete build).
 """
 import argparse
 import ast
@@ -56,9 +71,13 @@ SPLITS = ("train", "test", "eval")
 
 
 # ------------------------------------------------------------------------------------------------ rows
+class BadRow(ValueError):
+    """a source row the spec cannot render as intended"""
+
+
 class _Row(dict):
     def __missing__(self, k):
-        return ""
+        raise BadRow(f"no field {k!r} (fields: {', '.join(sorted(self))})")
 
 
 def _clean(v):
@@ -110,11 +129,33 @@ def rows(spec, rng):
             rng.shuffle(order)
             for i in order[:cap]:
                 if lines[i].strip():
-                    yield f"{f}:{i}", json.loads(lines[i])
+                    try:
+                        row = json.loads(lines[i])
+                    except ValueError as e:
+                        raise SystemExit(f"{f}:{i + 1}: not a JSON line ({e})") from None
+                    yield f"{f}:{i}", row
 
 
 _ROLE = {"system": "system", "human": "user", "user": "user", "gpt": "assistant", "assistant": "assistant",
-         "model": "assistant", "function_call": "assistant", "observation": "user", "tool": "user"}
+         "model": "assistant", "function_call": "assistant", "observation": "tool", "tool": "tool"}
+
+
+def _role(r, spec):
+    roles = {**_ROLE, **spec.get("roles", {})}
+    if r not in roles:
+        raise BadRow(f"unknown role {r!r}; map it with the domain's \"roles\"")
+    return roles[r]
+
+
+def _roles_ok(msgs, spec):
+    """messages / chat turns: every role mapped (the "roles" remap applies) to one a chat template knows"""
+    out = []
+    for m in msgs:
+        r = _role(m.get("role"), spec)
+        if r not in ("system", "user", "assistant", "tool"):
+            raise BadRow(f"role {m.get('role')!r} maps to {r!r}, not system / user / assistant / tool")
+        out.append(dict(m, role=r))
+    return out
 
 
 def _merge_roles(msgs):
@@ -173,8 +214,10 @@ def _tool_args(m):
         if isinstance(f.get("arguments"), str):
             try:
                 f = dict(f, arguments=json.loads(f["arguments"]))
-            except ValueError:
-                pass
+            except ValueError as e:
+                raise BadRow(f"tool-call arguments are not JSON ({e})") from None
+        if "arguments" in f and not isinstance(f["arguments"], dict):
+            raise BadRow(f"tool-call arguments are a {type(f['arguments']).__name__}, not an object")
         out.append(dict(c, function=f) if "function" in c else f)
     return dict(m, tool_calls=out)
 
@@ -184,7 +227,8 @@ def _st_character(name):
 
 
 def documents(name, spec, rng, tok):
-    """(group, doc id, item) where item is ("ids", list), ("text", str) or ("chat", messages, tools, chat kwargs)"""
+    """(group, doc id, item) where item is ("ids", list), ("text", str), ("chat", messages, tools, chat kwargs) or
+    ("bad", reason) for a row that cannot be rendered as specified (group None)"""
     for group, did, item in _documents(name, spec, rng, tok):
         if item[0] == "chat":
             item = (*item, spec.get("chat_kwargs"))
@@ -204,8 +248,11 @@ def _documents(name, spec, rng, tok):
         return
     if f == "sillytavern":
         for path in _files(spec, rng):
-            with open(path, encoding="utf-8") as fh:
-                lines = [json.loads(ln) for ln in fh if ln.strip()]
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    lines = [json.loads(ln) for ln in fh if ln.strip()]
+            except ValueError as e:
+                raise SystemExit(f"{path}: not a SillyTavern JSONL export ({e})") from None
             if not lines:
                 continue
             head = lines[0]
@@ -215,43 +262,81 @@ def _documents(name, spec, rng, tok):
                 group = fmt(spec["group"], head) if "group" in spec else _st_character(Path(path).parent.name)
                 yield group, path, ("chat", _merge_roles(msgs), None)
         return
+    if f not in FORMATS:
+        raise SystemExit(f"{name}: unknown format {f!r}")
     for rid, row in rows(spec, rng):
-        group = fmt(spec["group"], row) if "group" in spec else rid
-        if f == "text":
-            item = ("text", fmt(spec["text"], row))
-        elif f == "chat":
-            item = ("chat", _merge_roles(_turns(spec["turns"], row, spec.get("split_think", False), spec.get("replace"))), None)
-        elif f == "sharegpt":
-            conv = row[spec["field"]]
-            msgs = [{"role": _ROLE.get(m.get("from") or m.get("role"), "user"),
-                     "content": m.get("value") if "value" in m else m.get("content")} for m in conv]
-            msgs = [m for m in msgs + _turns(spec.get("append", []), row) if m["content"]]
-            item = ("chat", _merge_roles(msgs), None)
-        elif f == "messages":
-            msgs = [_tool_args({k: v for k, v in m.items() if v is not None}) for m in _literal(row[spec["field"]])]
-            tools = _literal(row[spec["tools"]]) if spec.get("tools") else None
-            item = ("chat", msgs, tools)
-        else:
-            raise SystemExit(f"{name}: unknown format {f!r}")
-        yield group, rid, item
+        try:
+            yield (*_row_item(f, spec, rid, row),)
+        except (BadRow, KeyError, IndexError, TypeError, SyntaxError) as e:
+            yield None, rid, ("bad", f"{type(e).__name__}: {e}")
+
+
+def _row_item(f, spec, rid, row):
+    group = fmt(spec["group"], row) if "group" in spec else rid
+    if not group:
+        raise BadRow(f"empty group key from {spec['group']!r}")
+    if f == "text":
+        return group, rid, ("text", fmt(spec["text"], row))
+    if f == "chat":
+        return group, rid, ("chat", _merge_roles(_roles_ok(_turns(spec["turns"], row, spec.get("split_think", False), spec.get("replace")), spec)), None)
+    if f == "sharegpt":
+        if spec["field"] not in row:
+            raise BadRow(f"no field {spec['field']!r}")
+        msgs = []
+        for m in row[spec["field"]]:
+            if "value" not in m and "content" not in m:
+                raise BadRow(f"message without value / content: {str(m)[:120]}")
+            msgs.append({"role": _role(m.get("from") or m.get("role"), spec),
+                         "content": m.get("value") if "value" in m else m.get("content")})
+        msgs = [m for m in msgs + _turns(spec.get("append", []), row) if m["content"]]
+        return group, rid, ("chat", _merge_roles(msgs), None)
+    if spec["field"] not in row:                         # messages
+        raise BadRow(f"no field {spec['field']!r}")
+    msgs = [_tool_args({k: v for k, v in m.items() if v is not None}) for m in _literal(row[spec["field"]])]
+    tools = _literal(row[spec["tools"]]) if spec.get("tools") else None
+    return group, rid, ("chat", _roles_ok(msgs, spec), tools)
+
+
+FORMATS = ("text", "chat", "sharegpt", "messages", "sillytavern", "text_file")
 
 
 # ------------------------------------------------------------------------------------------------ tokens
-class Tokenizer:
-    """HF tokenizer + chat template of the model; bos = the BOS id when llama.cpp adds one (the GGUF's
-    tokenizer.ggml.add_bos_token, read from `gguf`; HF configs disagree with it for some models)"""
+def gguf_bos(gguf, spec_bos=None):
+    """the BOS id llama.cpp puts at the start of a sequence, or None. From the GGUF's tokenizer.ggml.add_bos_token and
+    bos_token_id; spec_bos (true / false) is required when the GGUF has no add_bos_token (llama.cpp then falls back
+    to a default per vocab type) and must agree with it otherwise."""
+    from . import paths  # noqa: F401  (gguf-py on sys.path)
+    from gguf import GGUFReader
+    fields = GGUFReader(str(gguf)).fields
 
-    def __init__(self, path, n_ctx, chat_kwargs, gguf=None):
+    def val(k):
+        f = fields.get(k)
+        return None if f is None else f.parts[f.data[0]][0].item()
+    add = val("tokenizer.ggml.add_bos_token")
+    if add is None and spec_bos is None:
+        raise SystemExit(f"{gguf} has no tokenizer.ggml.add_bos_token (llama.cpp then uses a per-vocab default): "
+                         "set \"bos\": true or false in the spec to say whether llama.cpp adds BOS for this model")
+    if add is not None and spec_bos is not None and bool(add) != bool(spec_bos):
+        raise SystemExit(f"spec \"bos\": {spec_bos} but {gguf} has add_bos_token={bool(add)}")
+    add = bool(add) if add is not None else bool(spec_bos)
+    if not add:
+        return None
+    bid = val("tokenizer.ggml.bos_token_id")
+    if bid is None:
+        raise SystemExit(f"{gguf}: add_bos_token is set but there is no tokenizer.ggml.bos_token_id")
+    return int(bid)
+
+
+class Tokenizer:
+    """HF tokenizer + chat template of the model; bos = the BOS id llama.cpp adds per sequence (gguf_bos)"""
+
+    def __init__(self, path, n_ctx, chat_kwargs, bos):
         from transformers import AutoTokenizer
         self.t = AutoTokenizer.from_pretrained(path)
         self.n_ctx, self.chat_kwargs = n_ctx, chat_kwargs
-        add = getattr(self.t, "add_bos_token", False)
-        if gguf is not None:
-            from . import paths  # noqa: F401  (gguf-py on sys.path)
-            from gguf import GGUFReader
-            f = GGUFReader(str(gguf)).fields.get("tokenizer.ggml.add_bos_token")
-            add = bool(f.parts[-1][0]) if f is not None else add
-        self.bos = self.t.bos_token_id if add else None
+        if bos is not None and self.t.bos_token_id is not None and self.t.bos_token_id != bos:
+            raise SystemExit(f"BOS id: GGUF {bos}, HF tokenizer {self.t.bos_token_id}")
+        self.bos = bos
         self.name = str(path)
 
     def encode(self, text):
@@ -343,9 +428,15 @@ def allocate(weights, n, minimum=None):
     alloc = {k: int(v) for k, v in raw.items()}
     for k in sorted(raw, key=lambda k: raw[k] - alloc[k], reverse=True)[: n - sum(alloc.values())]:
         alloc[k] += 1
-    for k, m in (minimum or {}).items():
+    minimum = minimum or {}
+    if sum(minimum.values()) > n:
+        raise SystemExit(f"min_heldout {minimum} needs {sum(minimum.values())} sequences, the split has {n}")
+    for k, m in minimum.items():
         while alloc.get(k, 0) < m:
-            donor = max((d for d in alloc if d not in (minimum or {})), key=lambda d: alloc[d])
+            donors = [d for d in alloc if d != k and alloc[d] > minimum.get(d, 0)]
+            if not donors:
+                raise SystemExit(f"min_heldout of {k}: no other domain has sequences left to give ({alloc})")
+            donor = max(donors, key=lambda d: alloc[d])
             alloc[donor] -= 1
             alloc[k] = alloc.get(k, 0) + 1
     return alloc
@@ -359,29 +450,90 @@ def truncate(ids, spec, n_ctx):
 
 
 def pack(docs, n_seq, n_ctx, bos):
-    buf = [t for d in docs for t in d]
-    need = n_seq * n_ctx
+    """docs: [(group, ids)] -> ([n, n_ctx] int32 with n <= n_seq, groups with a token in the packed range)"""
+    buf = [t for _, d in docs for t in d]
     n = min(n_seq, len(buf) // n_ctx)
     arr = np.array(buf[:n * n_ctx], dtype=np.int32).reshape(n, n_ctx)
     if bos is not None and n:
         arr[:, 0] = bos
-    return arr, len(buf) >= need
+    used, pos = set(), 0
+    for g, d in docs:
+        if pos >= n * n_ctx:
+            break
+        if len(d):
+            used.add(g)
+        pos += len(d)
+    return arr, used
 
 
-def build(spec, tok, out, log=print):
-    n_ctx, seed, w = spec.get("n_ctx", 8192), spec.get("seed", 1), spec.get("window", 64)
+def _scored(row, bos):
+    """the positions of a packed row that hold document tokens (all of them, unless slot 0 is BOS)"""
+    return row[1:] if bos is not None else row
+
+
+def plan(spec):
+    """per split {domain: sequences}; raises SystemExit when the allocation or a min_heldout cannot be met"""
     doms = spec["domains"]
-    for name, d in doms.items():
-        d.setdefault("max_doc", spec.get("max_doc", 3000))
     weights = {k: d["weight"] for k, d in doms.items() if d.get("weight", 0) > 0}
     alloc = {}
     for s in SPLITS:
         ws = {k: v for k, v in weights.items() if s in doms[k].get("splits", SPLITS)}
         mins = {k: doms[k]["min_heldout"] for k in ws if s != "train" and doms[k].get("min_heldout")}
-        alloc[s] = allocate(ws, spec["sequences"][s], mins) if spec["sequences"].get(s) else {}
+        n = spec["sequences"].get(s, 0)
+        if not isinstance(n, int) or n < 0:
+            raise SystemExit(f"sequences.{s}: {n!r} is not a count")
+        alloc[s] = allocate(ws, n, mins) if n else {}
+        if sum(alloc[s].values()) != n:
+            raise SystemExit(f"{s}: {n} sequences requested but no domain with weight > 0 allows that split")
+    if not spec["sequences"].get("train"):
+        raise SystemExit("sequences.train must be > 0")
+    return alloc
+
+
+def check(spec, log=print):
+    """the spec without a tokenizer: formats, $VARS, files, exclude files, switches, allocation"""
+    bad = []
+    if spec.get("bos") is not None and not isinstance(spec["bos"], bool):
+        bad.append(f"bos: {spec['bos']!r} is not true / false / null")
+    for name, d in spec["domains"].items():
+        if d.get("weight", 0) <= 0:
+            continue
+        if d.get("format") not in FORMATS:
+            bad.append(f"{name}: unknown format {d.get('format')!r}")
+        if "skip_bad_rows" in d and not isinstance(d["skip_bad_rows"], bool):
+            bad.append(f"{name}: skip_bad_rows {d['skip_bad_rows']!r} is not true / false")
+        pat = os.path.expandvars(d.get("files", ""))
+        if "$" in pat:
+            bad.append(f"{name}: unset variable in {d.get('files')!r}")
+        elif d.get("format") == "text_file" and not os.path.isfile(pat):
+            bad.append(f"{name}: text_file needs one file, {pat!r} is not a file")
+        elif not [p for p in glob.glob(pat, recursive=True) if os.path.isfile(p)]:
+            bad.append(f"{name}: no files match {pat!r}")
+        for s in d.get("splits", SPLITS):
+            if s not in SPLITS:
+                bad.append(f"{name}: unknown split {s!r}")
+    for p in spec.get("exclude", []):
+        q = os.path.expandvars(p)
+        if "$" in q or not os.path.isfile(q):
+            bad.append(f"exclude file {p!r} -> {q!r} not found")
+    if bad:
+        raise SystemExit("corpus spec:\n  " + "\n  ".join(bad))
+    alloc = plan(spec)
+    for s in SPLITS:
+        log(f"{s:5s} {spec['sequences'].get(s, 0):4d} sequences: " + ", ".join(f"{k} {v}" for k, v in alloc[s].items() if v))
+    return alloc
+
+
+def build(spec, tok, out, log=print):
+    n_ctx, seed, w = spec["n_ctx"], spec.get("seed", 1), spec.get("window", 64)
+    doms = spec["domains"]
+    for name, d in doms.items():
+        d.setdefault("max_doc", spec.get("max_doc", 3000))
+    alloc = plan(spec)
     margin = spec.get("heldout_margin", 1.6)          # held-out tokens collected before cutting exposed runs
     collected = {s: {} for s in SPLITS}
     stats = {}
+    gsplit = {}                                        # group -> split, across all domains
     for name, d in sorted(doms.items(), key=lambda x: -x[1].get("weight", 0)):
         need = {s: alloc[s].get(name, 0) * n_ctx * (margin if s != "train" else 1) for s in SPLITS}
         if not any(need.values()):
@@ -389,9 +541,22 @@ def build(spec, tok, out, log=print):
         rng = random.Random(f"{seed}:{name}")
         got = {s: 0 for s in SPLITS}
         docs = {s: [] for s in SPLITS}
-        groups, gsplit = {s: set() for s in SPLITS}, {}
-        failed, t0 = 0, time.time()
+        groups = {s: set() for s in SPLITS}
+        n_bad, n_short, n_other, n_full, t0 = 0, 0, 0, 0, time.time()
+
+        def bad(did, why):
+            nonlocal n_bad
+            if not d.get("skip_bad_rows"):
+                raise SystemExit(f"{name}: row {did}: {why}\n(fix the spec or the data, or set \"skip_bad_rows\": true "
+                                 f"on {name} to skip and count such rows)")
+            n_bad += 1
+            if n_bad <= 3:
+                log(f"  {name}: skipped row {did}: {why[:200]}")
+
         for group, did, item in documents(name, d, rng, tok):
+            if item[0] == "bad":
+                bad(did, item[1])
+                continue
             s = gsplit.get(group)
             if s is None:                               # a new group goes where tokens are still needed, held-out first
                 open_ = [x for x in ("test", "eval", "train") if got[x] < need[x]]
@@ -399,70 +564,87 @@ def build(spec, tok, out, log=print):
                     break
                 s = gsplit[group] = open_[0]
                 groups[s].add(group)
+            elif group not in groups[s]:
+                if need[s] == 0:                        # the group is in a split this domain does not fill
+                    n_other += 1
+                    continue
+                groups[s].add(group)
             if got[s] >= need[s]:
+                n_full += 1
                 continue                                # a full held-out group's further docs are dropped, never moved
             try:
                 ids = tok(item)
-            except Exception as e:
-                failed += 1
-                if failed <= 2:
-                    log(f"  {name}: render failed ({type(e).__name__}: {str(e)[:160]})")
+            except Exception as e:                      # noqa: BLE001  (template errors are of many types)
+                bad(did, f"chat template: {type(e).__name__}: {e}")
                 continue
             ids = truncate(ids, d, n_ctx) if item[0] != "ids" else ids
             if len(ids) < 32:
+                n_short += 1
                 continue
-            docs[s].append((did, ids))
+            docs[s].append((group, did, ids))
             got[s] += len(ids)
             if all(got[x] >= need[x] for x in SPLITS):
                 break
         short = [s for s in SPLITS if got[s] < need[s] and (s == "train" or got[s] < need[s] / margin)]
         if short:
-            raise SystemExit(f"{name}: source exhausted ({', '.join(f'{s} {got[s]}/{int(need[s])}' for s in short)} tokens)")
+            raise SystemExit(f"{name}: source exhausted ({', '.join(f'{s} {got[s]}/{int(need[s])}' for s in short)} tokens; "
+                             f"{sum(len(g) for g in groups.values())} groups, {n_bad} bad rows, {n_short} docs under 32 "
+                             f"tokens, {n_other} docs of groups held by another domain's split, {n_full} docs of groups in a full split)")
         for s in SPLITS:
             collected[s][name] = docs[s]
         stats[name] = {s: {"groups": len(groups[s]), "docs": len(docs[s]), "tokens_collected": got[s]} for s in SPLITS}
-        stats[name]["render_failures"] = failed
+        stats[name].update(bad_rows_skipped=n_bad, short_docs=n_short, docs_of_other_split_groups=n_other,
+                           docs_of_full_split_groups=n_full)
         log(f"{name:18s} " + "  ".join(f"{s} {len(docs[s]):5d} docs/{len(groups[s]):4d} groups" for s in SPLITS)
-            + f"  ({time.time() - t0:.0f} s)")
+            + f"  ({time.time() - t0:.0f} s)" + (f"  {n_bad} bad rows skipped" if n_bad else ""))
 
     # train first; its windows (and the exclude texts') are what held-out text must not contain
     out.mkdir(parents=True, exist_ok=True)
+    (out / "manifest.json").unlink(missing_ok=True)
     seqs, owner = {}, {}
     tr = []
     for name, docs in collected["train"].items():
         if not alloc["train"].get(name):
             continue
-        arr, ok = pack([ids for _, ids in docs], alloc["train"][name], n_ctx, tok.bos)
-        assert ok, name
+        arr, used = pack([(g, ids) for g, _, ids in docs], alloc["train"][name], n_ctx, tok.bos)
+        if len(arr) < alloc["train"][name]:
+            raise SystemExit(f"train/{name}: {len(arr)} of {alloc['train'][name]} sequences")
+        stats[name]["train"]["groups_packed"] = len(used)
         tr.append(arr)
         owner.setdefault("train", []).extend([name] * len(arr))
     seqs["train"] = np.concatenate(tr)
     ex = Exposure(w)
     for row in seqs["train"]:
-        ex.add(row[1:])                                 # not across the BOS slot
+        ex.add(_scored(row, tok.bos))                   # not across the BOS slot
     for p in spec.get("exclude", []):
         ex.add(tok.encode(open(os.path.expandvars(p), encoding="utf-8").read()))
     ex.freeze()
     log(f"exposure reference: {len(ex.ref):,} distinct {w}-token windows (train + {len(spec.get('exclude', []))} exclude files)")
+    short = []
     for s in ("test", "eval"):
         part = []
         for name, docs in collected[s].items():
             if not alloc[s].get(name):
                 continue
             kept, cut, tot = [], 0, 0
-            for _, ids in docs:
+            for g, _, ids in docs:
                 pieces, c = ex.cut(ids)
-                kept.extend(pieces)
+                kept.extend((g, p) for p in pieces)
                 cut += c
                 tot += len(ids)
             n = alloc[s][name]
-            arr, ok = pack(kept, n, n_ctx, tok.bos)
-            if not ok:
-                log(f"  {s}/{name}: {len(arr)} of {n} sequences after cutting exposed runs")
+            arr, used = pack(kept, n, n_ctx, tok.bos)
+            if len(arr) < n:
+                short.append(f"{s}/{name}: {len(arr)} of {n} sequences after cutting exposed runs "
+                             f"({cut / max(tot, 1):.1%} of {tot} collected tokens cut)")
             part.append(arr)
             owner.setdefault(s, []).extend([name] * len(arr))
-            stats[name][s].update(exposed_tokens=cut, exposed_frac=round(cut / max(tot, 1), 4), sequences=len(arr))
+            stats[name][s].update(exposed_tokens=cut, exposed_frac=round(cut / max(tot, 1), 4), sequences=len(arr),
+                                  groups_packed=len(used))
         seqs[s] = np.concatenate(part) if part else np.zeros((0, n_ctx), np.int32)
+    if short:
+        raise SystemExit("held-out shortfall:\n  " + "\n  ".join(short) + f"\nraise \"heldout_margin\" (now {margin}) "
+                         "or give the domain more held-out data")
     for name in stats:
         stats[name]["train"]["sequences"] = alloc["train"].get(name, 0)
 
@@ -479,28 +661,41 @@ def build(spec, tok, out, log=print):
         log(f"{s}: {arr.shape}")
     # the held-out check, recomputed on the packed arrays: no held-out window may occur in train / exclude
     for s in ("test", "eval"):
-        hits = sum(int(ex.mask(row[1:].tolist()).sum()) for row in np.load(out / f"{s}.tokens.npy"))
+        hits = sum(int(ex.mask(_scored(row, tok.bos).tolist()).sum()) for row in np.load(out / f"{s}.tokens.npy"))
         manifest["splits"][s]["exposed_tokens_after_cut"] = hits
-        log(f"{s}: {hits} tokens in a {w}-window shared with train / exclude (packing junctions only)")
+        log(f"{s}: {hits} tokens in a {w}-window shared with train / exclude (windows across packing junctions)")
     with open(out / "eval.txt", "w", encoding="utf-8") as fh:
         for row in np.load(out / "eval.tokens.npy"):
-            fh.write(tok.decode(row[1:].tolist() if tok.bos is not None else row.tolist()))
+            fh.write(tok.decode(_scored(row, tok.bos).tolist()))
             fh.write("\n\n")
-    with open(out / "manifest.json", "w") as fh:
+    with open(out / "manifest.json.tmp", "w") as fh:
         json.dump(manifest, fh, indent=1)
+    os.replace(out / "manifest.json.tmp", out / "manifest.json")
     return manifest
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--spec", type=Path, required=True)
-    ap.add_argument("--tokenizer", type=Path, required=True, help="HF model directory (tokenizer + chat template)")
-    ap.add_argument("--gguf", type=Path, default=None, help="a GGUF of the model: whether llama.cpp adds BOS")
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--check", action="store_true", help="check the spec, its files and the allocation, then exit")
+    ap.add_argument("--tokenizer", type=Path, help="HF model directory (tokenizer + chat template)")
+    ap.add_argument("--gguf", type=Path, help="a GGUF of the model: whether llama.cpp adds BOS, and its id")
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--n-ctx", type=int, default=None, help="sequence length (overrides the spec's n_ctx)")
     a = ap.parse_args(argv)
     spec = json.load(open(a.spec))
-    tok = Tokenizer(a.tokenizer, spec.get("n_ctx", 8192), spec.get("chat_kwargs", {}), a.gguf)
-    build(spec, tok, a.out, log=lambda m: print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True))
+    if a.n_ctx:
+        spec["n_ctx"] = a.n_ctx
+    if not spec.get("n_ctx"):
+        ap.error("the spec has no n_ctx; give --n-ctx")
+    log = lambda m: print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)  # noqa: E731
+    check(spec, log)
+    if a.check:
+        return 0
+    if not (a.tokenizer and a.gguf and a.out):
+        ap.error("--tokenizer, --gguf and --out are required to build")
+    tok = Tokenizer(a.tokenizer, spec["n_ctx"], spec.get("chat_kwargs", {}), gguf_bos(a.gguf, spec.get("bos")))
+    build(spec, tok, a.out, log=log)
     return 0
 
 

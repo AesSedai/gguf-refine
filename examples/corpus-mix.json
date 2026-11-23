@@ -1,5 +1,5 @@
 {
- "_comment": "Thinking mode (chat_kwargs) only where the source has reasoning. The 2.5M-token calibration mix (weights as the K3.1 Hessian corpus) for ggufrefine.corpus. Paths use $DATASETS (local copies of the Hugging Face datasets, same directory layout), $KLD (calibration_datav5.txt), $PERSONAL_RP and $HELDOUT_RP (directories of SillyTavern chat exports, <character>/<chat>.jsonl). heldout_rp is eval-only: none of its characters is in train or test.",
+ "_comment": "Thinking mode (chat_kwargs) only where the source has reasoning. The 2.5M-token calibration mix (weights as the K3.1 Hessian corpus) for ggufrefine.corpus. Paths use $DATASETS (local copies of the Hugging Face datasets, same directory layout), $KLD (calibration_datav5.txt), $PERSONAL_RP and $HELDOUT_RP (directories of SillyTavern chat exports, <character>/<chat>.jsonl). heldout_rp is eval-only; SillyTavern groups are character names, and group keys are global, so a character present in both RP sets lands in one split.",
  "n_ctx": 8192,
  "max_doc": 3000,
  "seed": 1,

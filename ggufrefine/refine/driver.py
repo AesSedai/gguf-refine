@@ -70,7 +70,8 @@ class NpySink:
 
 class GgufSink:
     """refined codes written straight into a GGUF of the same layout, verified by read-back. The stock codes
-    must then come from the quantizer (RequantizedCodes), not from this file."""
+    must come from elsewhere (the untouched stock file, or the quantizer), not from this file: a resumed run would
+    otherwise read already-refined codes as stock."""
 
     def __init__(self, path):
         self.path = Path(path)

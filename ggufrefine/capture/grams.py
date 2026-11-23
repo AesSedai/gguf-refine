@@ -119,12 +119,17 @@ class Grams:
         return out
 
 
-def wait_space(d, need, reserve_gb, what):
+def wait_space(d, need, reserve_gb, what, wait=False):
+    """block until `need` bytes fit in d with reserve_gb to spare. wait=False (nothing frees space concurrently):
+    raise instead. wait=True only when a merger with --delete runs alongside and frees source dirs."""
     t0, last = time.time(), 0.0
     while True:
         free = shutil.disk_usage(d).free
         if free - need >= reserve_gb * 1e9:
             return time.time() - t0
+        if not wait:
+            raise OSError(f"{what}: {free / 1e9:.1f} GB free in {d}, the layer needs {need / 1e9:.1f} GB + {reserve_gb} GB "
+                          f"reserve. Free space on that filesystem (or point the output elsewhere) and rerun")
         if time.time() - last > 60:
             print(f"[{time.strftime('%H:%M:%S')}] {what}: {free / 1e9:.1f} GB free in {d}, need {need / 1e9:.1f} + "
                   f"{reserve_gb} GB reserve; waiting for the merger", flush=True)
@@ -132,13 +137,13 @@ def wait_space(d, need, reserve_gb, what):
         time.sleep(2.0)
 
 
-def write_layer(root, layer, flushed, meta_extra, reserve_gb=8.0):
+def write_layer(root, layer, flushed, meta_extra, reserve_gb=8.0, wait=False):
     """One process's Grams of one layer -> root/layer-<layer>/ (meta.json last, atomically)."""
     d = Path(root) / f"layer-{layer}"
     d.mkdir(parents=True, exist_ok=True)
     (d / "meta.json").unlink(missing_ok=True)
     need = sum(t.nbytes + s.nbytes for _, t, s in flushed.values())
-    waited = wait_space(d, need, reserve_gb, f"grams layer {layer}")
+    waited = wait_space(d, need, reserve_gb, f"grams layer {layer}", wait)
     groups = {}
     for key, (info, tri, s) in flushed.items():
         files = {"tri": f"{key}.tri.f32", "sum": f"{key}.sum.f64"}

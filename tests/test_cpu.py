@@ -6,6 +6,7 @@
 - ggufio / fold: per-expert reads, dequantized weights, in-place verified writes and folding on a synthetic GGUF
 - imatrix rows, knapsack vs brute force, overlap window detection
 """
+import contextlib
 import itertools
 import json
 import os
@@ -308,6 +309,114 @@ class Corpus(unittest.TestCase):
         a = corpus.allocate({"a": 0.9, "b": 0.08, "c": 0.02}, 10, {"c": 2})
         self.assertEqual(sum(a.values()), 10)
         self.assertGreaterEqual(a["c"], 2)
+        with self.assertRaises(SystemExit):                                   # minima larger than the split
+            corpus.allocate({"a": 0.5, "b": 0.5}, 4, {"a": 3, "b": 3})
+
+    def test_rows_are_strict(self):
+        with self.assertRaises(corpus.BadRow):                               # a field the template uses is missing
+            corpus.fmt("{problem}", {"seed_topic": "x"})
+        self.assertEqual(corpus.fmt("{a}{b}", {"a": "x", "b": None}), "x")  # present but null renders empty
+        conv = {"c": [{"from": "human", "value": "q"}, {"from": "observation", "value": "r"}, {"from": "gpt", "value": "a"}]}
+        _, _, item = corpus._row_item("sharegpt", {"field": "c"}, "r0", conv)
+        self.assertEqual([m["role"] for m in item[1]], ["user", "tool", "assistant"])
+        _, _, item = corpus._row_item("sharegpt", {"field": "c", "roles": {"observation": "user"}}, "r0", conv)
+        self.assertEqual([m["role"] for m in item[1]], ["user", "assistant"])   # remapped, then merged with the user turn
+        with self.assertRaises(corpus.BadRow):
+            corpus._row_item("sharegpt", {"field": "c"}, "r0", {"c": [{"from": "speaker", "value": "x"}]})
+        with self.assertRaises(corpus.BadRow):
+            corpus._tool_args({"tool_calls": [{"function": {"name": "f", "arguments": "{not json"}}]})
+
+    def test_groups_are_global_and_counted_when_packed(self):
+        """the same group key in two domains lands in one split; groups_packed counts groups with packed tokens"""
+        r = np.random.default_rng(0)
+        MARK = 10000
+
+        def docs_for(name, d, rng, tok):
+            for g in range(60):
+                yield f"g{g}", f"{name}-{g}", ("ids", [MARK + g] + r.integers(0, 500, 99).tolist())
+
+        class Tok:
+            bos, name, chat_kwargs, n_ctx = None, "fake", {}, 100
+
+            def __call__(self, item):
+                return list(item[1])
+
+            def encode(self, text):
+                return []
+
+            def decode(self, ids):
+                return ""
+        spec = {"n_ctx": 100, "window": 8, "seed": 1, "sequences": {"train": 8, "test": 2, "eval": 4},
+                "domains": {"a": {"weight": 0.9, "format": "text"},
+                            "b": {"weight": 0.1, "format": "text", "splits": ["eval"], "min_heldout": 2}}}
+        orig = corpus.documents
+        corpus.documents = docs_for
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                m = corpus.build(spec, Tok(), Path(td), log=lambda *_: None)
+                arr = {s: np.load(Path(td) / f"{s}.tokens.npy") for s in corpus.SPLITS}
+        finally:
+            corpus.documents = orig
+        gs = {s: set((a[a >= MARK] - MARK).tolist()) for s, a in arr.items()}
+        self.assertFalse(gs["train"] & gs["eval"])
+        self.assertFalse(gs["train"] & gs["test"])
+        self.assertFalse(gs["test"] & gs["eval"])
+        self.assertGreater(m["domains"]["b"]["docs_of_other_split_groups"], 0)   # b's docs of a's train / test groups
+        self.assertEqual(m["domains"]["a"]["train"]["groups_packed"], 8)         # 8 x 100 tokens = 8 docs of 100
+
+    def test_bos_from_gguf(self):
+        with tempfile.TemporaryDirectory() as td:
+            def gg(**kv):
+                p = Path(td) / f"t{'-'.join(f'{k}{v}' for k, v in sorted(kv.items()))}.gguf"
+                w = GGUFWriter(str(p), "llama")
+                if "add" in kv:
+                    w.add_bool("tokenizer.ggml.add_bos_token", kv["add"])
+                if "bid" in kv:
+                    w.add_uint32("tokenizer.ggml.bos_token_id", kv["bid"])
+                w.write_header_to_file()
+                w.write_kv_data_to_file()
+                w.write_tensors_to_file()
+                w.close()
+                return p
+            self.assertEqual(corpus.gguf_bos(gg(add=True, bid=7)), 7)
+            self.assertIsNone(corpus.gguf_bos(gg(add=False)))
+            with self.assertRaises(SystemExit):                              # no key: the spec must say
+                corpus.gguf_bos(gg())
+            self.assertIsNone(corpus.gguf_bos(gg(), spec_bos=False))
+            with self.assertRaises(SystemExit):                              # spec contradicts the GGUF
+                corpus.gguf_bos(gg(add=False), spec_bos=True)
+
+
+class Report(unittest.TestCase):
+    """ggufrefine.eval.report: the null check and the subset arguments fail loudly"""
+
+    def _run(self, td, name, kld):
+        d = Path(td) / name
+        d.mkdir()
+        with open(d / "eval.chunks.tsv", "w") as fh:
+            fh.write("chunk\tn_tok\tkld_sum\tnll_sum\tnll_base_sum\tn_same_top\n")
+            for i, k in enumerate(kld):
+                fh.write(f"{i}\t100\t{k * 100}\t200\t190\t90\n")
+        return f"{name}={d}"
+
+    def test_null_and_subsets(self):
+        from ggufrefine.eval import report
+        with tempfile.TemporaryDirectory() as td:
+            man = Path(td) / "manifest.json"
+            man.write_text(json.dumps({"splits": {"eval": {"domain_of_sequence": ["x_rp", "y", "y"]}}}))
+            runs = [self._run(td, "stock", [0.2, 0.1, 0.1]), self._run(td, "ok", [0.0, 0.0, 0.0])]
+            bad = self._run(td, "bad", [0.0, 0.01, 0.0])
+            q = ["--base", "eval", "--manifest", str(man)]
+            with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn), contextlib.redirect_stderr(dn):
+                self.assertEqual(report.main(q + ["--null", "ok", "--pool", "rp=*rp", *runs]), 0)
+                self.assertEqual(report.main(q + ["--null", "bad", runs[0], bad]), 3)
+                with self.assertRaises(SystemExit):
+                    report.main(q + ["--without", "z", *runs])
+                with self.assertRaises(SystemExit):
+                    report.main(q + ["--pool", "rp=*zz", *runs])
+                man.write_text(json.dumps({"splits": {"eval": {"domain_of_sequence": ["x_rp", "y", "y", "y"]}}}))
+                with self.assertRaises(SystemExit):                          # 3 chunks scored, manifest has 4
+                    report.main(q + runs)
 
 
 if __name__ == "__main__":

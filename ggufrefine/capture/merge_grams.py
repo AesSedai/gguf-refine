@@ -163,11 +163,15 @@ def scan(src):
             m = read_meta(d)
             if m.get("part") is None:
                 raise ValueError(f"{d}: no part id in meta (capture with --part-id)")
+            prev = [x for x in out.get(str(m["layer"]), []) if x[0] == int(m["part"])]
+            if prev:
+                raise SystemExit(f"layer {m['layer']}: part {m['part']} in both {prev[0][1]} and {d}")
             out.setdefault(str(m["layer"]), []).append((int(m["part"]), d, m))
     return out
 
 
-def write_index(out, test_parts):
+def write_index(out, test_parts, check=None):
+    """out/index.json from the merged layers; check(idx) runs before it is published (raises to refuse)"""
     idx = {"format": FORMAT + "-index", "version": VERSION,
            "splits": {"test": {"definition": f"parts {sorted(test_parts)}"},
                       "train": {"definition": f"every part except {sorted(test_parts)}"}},
@@ -192,6 +196,8 @@ def write_index(out, test_parts):
         idx["splits"][split]["parts"] = sorted(parts)
     idx["bytes"] = total
     idx["layers"] = dict(sorted(idx["layers"].items(), key=lambda kv: lkey(kv[0])))
+    if check is not None:
+        check(idx)
     tmp = out / "index.json.tmp"
     json.dump(idx, open(tmp, "w"), indent=1)
     os.replace(tmp, out / "index.json")
@@ -246,6 +252,8 @@ def main():
     ap.add_argument("--expect", default="", help="with --watch: part ids of the running round; a layer is merged "
                     "once all of them (in that split) have it, or its files are older than --max-wait")
     ap.add_argument("--max-wait", type=float, default=900.0)
+    ap.add_argument("--require-parts", default="", help="after the final pass, every layer must hold exactly these "
+                    "part ids (train: those not in --test-parts, test: those in it); fails otherwise")
     ap.add_argument("--poll", type=float, default=10.0)
     a = ap.parse_args()
     test_parts = {int(x) for x in a.test_parts.split(",") if x}
@@ -262,7 +270,21 @@ def main():
                 write_index(a.out, test_parts)
                 last = time.time()
     one_pass(a, test_parts, final=True)
-    total = write_index(a.out, test_parts)
+    check = None
+    if a.require_parts:
+        req = {int(x) for x in a.require_parts.split(",") if x}
+        want = {"train": sorted(req - test_parts), "test": sorted(req & test_parts)}
+
+        def check(idx):
+            bad = [f"layer {L} {s}: parts {ent.get(s, {}).get('parts')} (want {want[s]})"
+                   for L, ent in idx["layers"].items() for s in want if want[s] and ent.get(s, {}).get("parts") != want[s]]
+            if not idx["layers"] or bad:
+                raise SystemExit("merged Grams do not hold the required parts (no index.json written):\n  "
+                                 + "\n  ".join(bad[:20] or ["no layers"]))
+            log(f"every layer holds train parts {want['train']} and test parts {want['test']}")
+    if a.require_parts:                         # an index from an earlier, unchecked pass must not stand
+        (a.out / "index.json").unlink(missing_ok=True)
+    total = write_index(a.out, test_parts, check)
     left = sum(len(v) for v in scan(a.src).values())
     log(f"index written: {total / 1e9:.1f} GB merged in {a.out}; {left} source layer dirs left in {a.src}")
     return 0
