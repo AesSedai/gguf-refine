@@ -303,9 +303,7 @@ class Corpus(unittest.TestCase):
         for p in pieces:
             self.assertFalse(ex.mask(p).any())
 
-    def test_character_groups_and_allocation(self):
-        self.assertEqual(corpus._st_character("Dave3"), "dave")
-        self.assertEqual(corpus._st_character("Dave & Erin"), "dave & erin")
+    def test_allocation(self):
         a = corpus.allocate({"a": 0.9, "b": 0.08, "c": 0.02}, 10, {"c": 2})
         self.assertEqual(sum(a.values()), 10)
         self.assertGreaterEqual(a["c"], 2)
@@ -317,14 +315,45 @@ class Corpus(unittest.TestCase):
             corpus.fmt("{problem}", {"seed_topic": "x"})
         self.assertEqual(corpus.fmt("{a}{b}", {"a": "x", "b": None}), "x")  # present but null renders empty
         conv = {"c": [{"from": "human", "value": "q"}, {"from": "observation", "value": "r"}, {"from": "gpt", "value": "a"}]}
-        _, _, item = corpus._row_item("sharegpt", {"field": "c"}, "r0", conv)
+        _, _, item = corpus._row_item("tool_chat", {"messages": "c"}, "r0", conv)
         self.assertEqual([m["role"] for m in item[1]], ["user", "tool", "assistant"])
-        _, _, item = corpus._row_item("sharegpt", {"field": "c", "roles": {"observation": "user"}}, "r0", conv)
+        with self.assertRaises(corpus.BadRow):                               # a tool message in a chat domain
+            corpus._row_item("chat", {"messages": "c"}, "r0", conv)
+        _, _, item = corpus._row_item("chat", {"messages": "c", "roles": {"observation": "user"}}, "r0", conv)
         self.assertEqual([m["role"] for m in item[1]], ["user", "assistant"])   # remapped, then merged with the user turn
         with self.assertRaises(corpus.BadRow):
-            corpus._row_item("sharegpt", {"field": "c"}, "r0", {"c": [{"from": "speaker", "value": "x"}]})
+            corpus._row_item("chat", {"messages": "c"}, "r0", {"c": [{"from": "speaker", "value": "x"}]})
+        call = {"c": [{"role": "user", "content": "q"},
+                      {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}}]},
+                      {"role": "tool", "content": "r"}, {"role": "assistant", "content": ""}], "t": [{"name": "f"}]}
+        _, _, item = corpus._row_item("tool_chat", {"messages": "c", "tools": "t"}, "r0", call)
+        self.assertEqual([m["role"] for m in item[1]], ["user", "assistant", "tool"])   # the empty last turn dropped
+        self.assertEqual(item[1][1]["tool_calls"][0]["function"]["arguments"], {"x": 1})
+        self.assertEqual(item[2], [{"name": "f"}])
+        with self.assertRaises(corpus.BadRow):
+            corpus._row_item("chat", {"messages": "c"}, "r0", call)
         with self.assertRaises(corpus.BadRow):
             corpus._tool_args({"tool_calls": [{"function": {"name": "f", "arguments": "{not json"}}]})
+        _, _, item = corpus._row_item("chat", {"turns": [{"role": "user", "content": "{q}"},
+                                                         {"role": "assistant", "content": "<think>r</think>a"}],
+                                               "split_think": True}, "r0", {"q": "x"})
+        self.assertEqual(item[1][1], {"role": "assistant", "content": "a", "reasoning_content": "r"})
+
+    def test_check_formats(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "a.jsonl")
+            open(f, "w").close()
+            base = {"n_ctx": 64, "sequences": {"train": 1}}
+            for dom, msg in [({"format": "sillytavern"}, "unknown format"),
+                             ({"format": "chat"}, "exactly one of"),
+                             ({"format": "chat", "messages": "m", "tools": "t"}, "for format tool_chat"),
+                             ({"format": "chat", "field": "m", "messages": "m"}, "now \"messages\""),
+                             ({"format": "text"}, "needs \"text\"")]:
+                with self.assertRaises(SystemExit) as e:
+                    corpus.check({**base, "domains": {"a": {"weight": 1, "files": f, **dom}}}, log=lambda *_: None)
+                self.assertIn(msg, str(e.exception))
+            corpus.check({**base, "domains": {"a": {"weight": 1, "files": f, "format": "tool_chat", "messages": "m",
+                                                    "tools": "t"}}}, log=lambda *_: None)
 
     def test_groups_are_global_and_counted_when_packed(self):
         """the same group key in two domains lands in one split; groups_packed counts groups with packed tokens"""

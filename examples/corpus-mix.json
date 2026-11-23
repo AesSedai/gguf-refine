@@ -1,5 +1,5 @@
 {
- "_comment": "Thinking mode (chat_kwargs) only where the source has reasoning. The 2.5M-token calibration mix (weights as the K3.1 Hessian corpus) for ggufrefine.corpus. Paths use $DATASETS (local copies of the Hugging Face datasets, same directory layout), $KLD (calibration_datav5.txt), $PERSONAL_RP and $HELDOUT_RP (directories of SillyTavern chat exports, <character>/<chat>.jsonl). heldout_rp is eval-only; SillyTavern groups are character names, and group keys are global, so a character present in both RP sets lands in one split.",
+ "_comment": "Thinking mode (chat_kwargs) only where the source has reasoning. The 2.5M-token calibration mix (weights as the K3.1 Hessian corpus) for ggufrefine.corpus. Paths use $DATASETS (local copies of the Hugging Face datasets, same directory layout), $KLD (calibration_datav5.txt), $PERSONAL_RP and $HELDOUT_RP (your own role-play chats, converted to JSONL rows {\"messages\": [{\"role\", \"content\"}, ...], \"group\": \"<character>\"}). heldout_rp is eval-only; the RP groups are character names, and group keys are global, so a character present in both RP sets lands in one split. agent_swe is the only source with structured tool calls (tool_chat); tools_agentic writes its actions as assistant text, so it is plain chat.",
  "n_ctx": 8192,
  "max_doc": 3000,
  "seed": 1,
@@ -9,19 +9,20 @@
  "domains": {
   "code": {"weight": 0.1838, "format": "text", "files": "$DATASETS/storagestuffnobody/mid-training-40b/data/stack/train/*.parquet",
            "columns": ["text"], "text": "{text}", "rows_per_file": 40},
-  "agent_swe": {"weight": 0.1682, "format": "messages", "files": "$DATASETS/nebius/SWE-rebench-openhands-trajectories/trajectories.parquet",
-                "columns": ["trajectory", "tools"], "field": "trajectory", "tools": "tools", "window": "middle", "max_doc": 8192},
-  "personal_rp": {"weight": 0.12, "format": "sillytavern", "files": "$PERSONAL_RP/*/*.jsonl", "min_heldout": 3},
+  "agent_swe": {"weight": 0.1682, "format": "tool_chat", "files": "$DATASETS/nebius/SWE-rebench-openhands-trajectories/trajectories.parquet",
+                "columns": ["trajectory", "tools"], "messages": "trajectory", "tools": "tools", "window": "middle", "max_doc": 8192},
+  "personal_rp": {"weight": 0.12, "format": "chat", "files": "$PERSONAL_RP/*/*.jsonl", "messages": "messages", "group": "{group}",
+                  "min_heldout": 3},
   "calib5": {"weight": 0.0945, "format": "text_file", "files": "$KLD/calibration_datav5.txt", "splits": ["train"]},
   "code_edit": {"weight": 0.0864, "format": "chat", "files": "$DATASETS/bigcode/commitpackft/data/*/data.jsonl", "rows_per_file": 120,
                 "turns": [{"role": "user", "content": "{message}\n\n```{old_file}\n{old_contents}\n```"},
                           {"role": "assistant", "content": "```{new_file}\n{new_contents}\n```"}]},
-  "rp": {"weight": 0.08, "format": "sharegpt", "files": "$DATASETS/Gryphe/Sonnet3.5-Charcard-Roleplay/*.jsonl", "field": "conversations",
+  "rp": {"weight": 0.08, "format": "chat", "files": "$DATASETS/Gryphe/Sonnet3.5-Charcard-Roleplay/*.jsonl", "messages": "conversations",
          "group": "{conversations[0][value]}"},
   "technical": {"weight": 0.048, "format": "text", "files": "$DATASETS/storagestuffnobody/mid-training-40b/data/finepdf/train/*.parquet",
                 "columns": ["text"], "text": "{text}", "rows_per_file": 40},
-  "tools_agentic": {"weight": 0.0361, "format": "sharegpt", "files": "$DATASETS/CharlieDreemur/OpenManus-RL/data/*.parquet",
-                    "columns": ["conversations"], "field": "conversations"},
+  "tools_agentic": {"weight": 0.0361, "format": "chat", "files": "$DATASETS/CharlieDreemur/OpenManus-RL/data/*.parquet",
+                    "columns": ["conversations"], "messages": "conversations"},
   "openmath_cot": {"weight": 0.0229, "format": "chat", "files": "$DATASETS/nvidia/OpenMathReasoning/data/cot-*.parquet",
                    "columns": ["problem", "generated_solution"], "rows_per_file": 60, "split_think": true,
                    "chat_kwargs": {"enable_thinking": true},
@@ -32,8 +33,8 @@
                      "chat_kwargs": {"enable_thinking": true},
                      "turns": [{"role": "user", "content": "{problem}"},
                                {"role": "assistant", "content": "{solution}", "reasoning_content": "{explanation}"}]},
-  "chat": {"weight": 0.02, "format": "sharegpt", "files": "$DATASETS/PJMixers-Dev/LMSYS-Chat-1M-ReRolls/data/*.parquet",
-           "columns": ["prompt", "responses"], "field": "prompt", "append": [{"role": "assistant", "content": "{responses[0][response]}"}],
+  "chat": {"weight": 0.02, "format": "chat", "files": "$DATASETS/PJMixers-Dev/LMSYS-Chat-1M-ReRolls/data/*.parquet",
+           "columns": ["prompt", "responses"], "messages": "prompt", "append": [{"role": "assistant", "content": "{responses[0][response]}"}],
            "group": "{prompt[0][value]}"},
   "books": {"weight": 0.02, "format": "text", "files": "$DATASETS/uncleaned-epub-txt/*.parquet", "columns": ["text"], "text": "{text}",
             "rows_per_file": 24},
@@ -53,6 +54,7 @@
   "sql": {"weight": 0.02, "format": "chat", "files": "$DATASETS/b-mc2/sql-create-context/default/train/*.parquet",
           "columns": ["context", "question", "answer"],
           "turns": [{"role": "user", "content": "{context}\n\n{question}"}, {"role": "assistant", "content": "{answer}"}]},
-  "heldout_rp": {"weight": 0.08, "format": "sillytavern", "files": "$HELDOUT_RP/*/*.jsonl", "splits": ["eval"], "min_heldout": 3}
+  "heldout_rp": {"weight": 0.08, "format": "chat", "files": "$HELDOUT_RP/*/*.jsonl", "messages": "messages", "group": "{group}",
+                 "splits": ["eval"], "min_heldout": 3}
  }
 }

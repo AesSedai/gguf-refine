@@ -127,14 +127,16 @@ affects:
 `ggufrefine.corpus` builds three splits from one spec: `train` (the Hessians), `test` (held-out Grams: the held-out
 reconstruction error in the refine journals) and `eval` (the KLD base). A spec is a list of sources ("domains"); a
 domain is a label for allocation and reporting, nothing depends on particular names or on there being role-play,
-characters or several domains. Held-out data is clean in three ways:
+characters or several domains. Data is bring-your-own: the corpus builder reads plain text, rows with a text field,
+and conversations as lists of role / content messages; converting other exports (chat frontends, custom logs) into
+one of those is the operator's job. Held-out data is clean in three ways:
 
 - **By group, before packing.** A group is what must not straddle the split. By default it is the document; a
-  domain's `"group"` template names something shared (a system prompt / character card:
-  `"group": "{conversations[0][value]}"`); SillyTavern exports group by character directory, trailing digits dropped
-  (`Dave`, `Dave1` and every branch of a chat are one group). Group keys are global: the same key in two domains is
-  one group, in one split. A group goes to one split; when that split is full, the group's further documents are
-  dropped, never moved to train (counted in the manifest).
+  domain's `"group"` template names something shared over the row: a system prompt / character card
+  (`"group": "{conversations[0][value]}"`), or a field you wrote when converting (`"group": "{group}"`, e.g. the
+  character of a role-play chat, so every chat and branch of one character is one group). Group keys are global:
+  the same key in two domains is one group, in one split. A group goes to one split; when that split is full, the
+  group's further documents are dropped, never moved to train (counted in the manifest).
 - **By content.** Every held-out token inside a 64-token run that also occurs in train or in an `exclude` file (the
   imatrix text) is cut out. The manifest reports the cut fraction per domain (shared tool-prompt templates lose
   ~20-30%, most domains under 4%) and the residue after packing (`exposed_tokens_after_cut`: windows across the
@@ -152,15 +154,30 @@ is eval sequence i. Chat domains are rendered with the model's own template; thi
 the source has reasoning. BOS: from the GGUF (`tokenizer.ggml.add_bos_token` and `bos_token_id`); when the GGUF has
 no such key the spec must say `"bos": true` or `false` (llama.cpp would use a per-vocab default).
 
-Rows are strict: a row that lacks a field its templates use, a message with an unknown role, tool-call arguments
-that are not JSON, or a conversation the chat template rejects stops the build with the domain, the row id and the
-reason. A source with a few malformed rows can set `"skip_bad_rows": true` on its domain; skipped rows are counted
-(`bad_rows_skipped`) and the first ones logged. A null field renders as an empty string (a missing one is an error).
-ShareGPT roles: `system`, `human`/`user`, `gpt`/`assistant`/`model`, `function_call` (an assistant turn),
-`observation`/`tool` (a tool turn); `"roles": {"observation": "user"}` remaps for a template without a tool role.
+Formats are by what the chat template renders, not by where the data came from:
 
-Writing a spec: one entry per source, `format` one of `text`, `chat`, `sharegpt`, `messages`, `sillytavern`,
-`text_file` (fields in `ggufrefine/corpus.py`'s docstring). `python -m ggufrefine.corpus --spec S --check` checks
+| `format` | rendered as | a row is |
+|---|---|---|
+| `text_file` | raw text, no template | one text file, cut into `n_ctx`-token documents |
+| `text` | raw text, no template | a `"text"` template over the row's fields |
+| `chat` | the model's chat template; system / user / assistant turns, optional `reasoning_content` | `"messages"`: the row field holding the message list, or `"turns"`: message templates over the row |
+| `tool_chat` | as `chat`, plus assistant `tool_calls`, `tool` turns and the row's tool definitions (`"tools"`: a field) | as `chat` |
+
+A tool call or tool turn in a `chat` domain is an error, so tool-calling data is always rendered with the
+template's tool markup. Tool calls are not validated against the tool definitions (nothing is executed); their
+arguments must be a JSON object, which the templates need to render them.
+
+Rows are strict: a row that lacks a field its templates use, a message with an unknown role, a tool call in a
+`chat` domain, tool-call arguments that are not a JSON object, or a conversation the chat template rejects stops the
+build with the domain, the row id and the reason. A source with a few malformed rows can set `"skip_bad_rows": true`
+on its domain; skipped rows are counted (`bad_rows_skipped`) and the first ones logged. A null field renders as an empty string (a missing one is an error);
+a turn left with no content, reasoning or tool call is dropped, and consecutive turns of one role are joined.
+Messages use `role` / `content` keys or ShareGPT `from` / `value`; roles `system`, `human`/`user`,
+`gpt`/`assistant`/`model`, `function_call` (assistant), `observation`/`tool` (tool); `"roles": {"speaker": "user"}`
+maps others.
+
+Writing a spec: one entry per source, `format` one of `text_file`, `text`, `chat`, `tool_chat` (fields in
+`ggufrefine/corpus.py`'s docstring). `python -m ggufrefine.corpus --spec S --check` checks
 files and allocation without a tokenizer; a build into a scratch directory with small `sequences` checks rendering
 (look at a few documents of each chat domain in `eval.txt`). A source that runs out raises `source exhausted` with
 its group, bad-row and short-document counts: raise its `rows_per_file` (parquet / JSONL sources), add files or
@@ -201,7 +218,7 @@ difference: the refinement's visit-order seed alone moves KLD by up to ~10% on g
   logits per ubatch (`invalid argument` in `ggml_cuda_op_softcap`). Set `UB=4096`.
 - **Chat-template-sensitive models** (gemma): PPL / KLD on text with chat markup typed as plain text measures
   something the model never sees in serving; use the token-file eval base (stage 5), which this pipeline does.
-- **Tool calls**: `messages` sources with JSON-string `arguments` are parsed to mappings (templates iterate them).
+- **Tool calls**: `tool_chat` sources with JSON-string `arguments` are parsed to mappings (templates iterate them).
 - **Stock compatibility**: the refined file has the stock file's layout and types; the pipeline scores it with the
   patched build in `native/`, which does not build `llama-cli`. To check it in an unmodified llama.cpp build, run
   that build's `llama-cli -m <refined> -p hi -n 8`.

@@ -3,7 +3,8 @@
 Splits: `train` (the Hessians), `test` (held-out Grams: the held-out reconstruction error in the refine logs) and
 `eval` (the KLD base). Leakage is prevented at three levels:
   1. Documents are assigned to splits by GROUP before packing (a group is whatever must not straddle the split: a
-     role-play character, a shared system prompt / character card, by default the document itself), and each split
+     shared system prompt / character card, a field the operator wrote such as a role-play character, by default the
+     document itself), and each split
      is packed separately, so no document crosses a split. Group keys are global: the same key in two domains is one
      group, in one split.
   2. Every held-out token that lies in a `window`-token run (default 64) also present anywhere in train, or in an
@@ -31,18 +32,23 @@ Spec (paths may use $VARS):
                 "group": "<format string over the row>", "splits": ["train", "test", "eval"],
                 "min_heldout": 2, "rows_per_file": 400, "max_doc": 3000, "window": "head" | "middle",
                 "chat_kwargs": {"enable_thinking": true}, "replace": {"-": "<content for a turn that is exactly '-'>"},
-                "roles": {"observation": "user"}, "skip_bad_rows": false}}}
-Formats (fields are str.format templates over a row; "{a[0][b]}" indexes nested values; a null field renders as ""):
-  text       "text": "{text}"
-  chat       "turns": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "...",
-             "reasoning_content": "..."}], "split_think": true (assistant "<think>R</think>A" -> reasoning R)
-  sharegpt   "field": "conversations" (from/value or role/content), optional "append": [turn templates]; roles
-             system, human/user, gpt/assistant/model, function_call (-> assistant), observation/tool (-> tool);
-             "roles" maps others, or remaps (e.g. tool -> user for a template without a tool role)
-  messages   "field": "trajectory" (role/content dicts, JSON or Python literal), optional "tools": "<field>"
-  sillytavern  SillyTavern chat exports (<character>/<chat>.jsonl); the group defaults to the character directory
-             (trailing digits dropped: Dave, Dave1 and Dave2 are one group, so a chat's branches never straddle splits)
+                "roles": {"speaker": "user"}, "skip_bad_rows": false}}}
+Formats, by what is rendered (data is bring-your-own: convert other exports to one of these rows). Fields are
+str.format templates over a row; "{a[0][b]}" indexes nested values; a null field renders as "":
   text_file  one text file cut into n_ctx-token documents ("splits": ["train"] for an imatrix file reused in train)
+  text       raw text, no template: "text": "{text}"
+  chat       the model's chat template over system / user / assistant turns, taken from either
+             "messages": "<field>"  the row field holding a message list (JSON / Python literal strings accepted;
+                                    role/content or ShareGPT from/value keys), optional "append": [turn templates]
+             "turns": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "...",
+                       "reasoning_content": "..."}]  message templates over the row
+             "split_think": true (assistant "<think>R</think>A" -> reasoning R); "replace": {content: substitute};
+             roles system, human/user, gpt/assistant/model, function_call (-> assistant), observation/tool (-> tool),
+             "roles" maps others. A tool call or tool turn is an error (use tool_chat). Turns with no content,
+             reasoning or tool call are dropped; consecutive turns of one role are joined.
+  tool_chat  as chat, plus assistant tool_calls (arguments a JSON object or JSON string of one), tool turns, and
+             optional "tools": "<field>" (the row's tool definitions, rendered by the template). Calls are not
+             checked against the definitions.
 Sequences per split are allocated over domains by weight (largest remainder); `min_heldout` sets a minimum of a
 domain's test / eval sequences (taken from the largest other domains). `splits` restricts a domain (e.g. a
 held-out-only source).
@@ -59,7 +65,6 @@ import hashlib
 import json
 import os
 import random
-import re
 import string
 import sys
 import time
@@ -138,23 +143,32 @@ def rows(spec, rng):
 
 _ROLE = {"system": "system", "human": "user", "user": "user", "gpt": "assistant", "assistant": "assistant",
          "model": "assistant", "function_call": "assistant", "observation": "tool", "tool": "tool"}
+_ROLES = ("system", "user", "assistant", "tool")
 
 
 def _role(r, spec):
     roles = {**_ROLE, **spec.get("roles", {})}
     if r not in roles:
         raise BadRow(f"unknown role {r!r}; map it with the domain's \"roles\"")
+    if roles[r] not in _ROLES:
+        raise BadRow(f"role {r!r} maps to {roles[r]!r}, not {' / '.join(_ROLES)}")
     return roles[r]
 
 
-def _roles_ok(msgs, spec):
-    """messages / chat turns: every role mapped (the "roles" remap applies) to one a chat template knows"""
-    out = []
-    for m in msgs:
-        r = _role(m.get("role"), spec)
-        if r not in ("system", "user", "assistant", "tool"):
-            raise BadRow(f"role {m.get('role')!r} maps to {r!r}, not system / user / assistant / tool")
-        out.append(dict(m, role=r))
+def _message(m, spec):
+    """a source message -> {role, content, ...}: role / content keys, or ShareGPT from / value; other keys
+    (reasoning_content, tool_calls, ...) kept, null values dropped"""
+    if not isinstance(m, dict):
+        raise BadRow(f"message is a {type(m).__name__}, not an object: {str(m)[:120]}")
+    if "content" not in m and "value" not in m and not m.get("tool_calls"):
+        raise BadRow(f"message without content / value: {str(m)[:120]}")
+    out = {k: v for k, v in m.items() if k not in ("from", "value") and v is not None}
+    c = m["value"] if "value" in m else m.get("content")
+    if c is None:
+        out.pop("content", None)
+    else:
+        out["content"] = c
+    out["role"] = _role(m.get("from") or m.get("role"), spec)
     return out
 
 
@@ -175,23 +189,6 @@ def _split_think(text):
         r, a = text.split("</think>", 1)
         return r.replace("<think>", "", 1).strip(), a.strip()
     return "", text
-
-
-def _turns(templates, row, split_think=False, replace=None):
-    out = []
-    for t in templates:
-        m = {k: fmt(v, row) for k, v in t.items()}
-        if replace and m.get("content", "").strip() in replace:
-            m["content"] = replace[m["content"].strip()]
-        if split_think and m["role"] == "assistant" and not m.get("reasoning_content"):
-            r, a = _split_think(m["content"])
-            m["content"] = a
-            if r:
-                m["reasoning_content"] = r
-        if not m.get("reasoning_content"):
-            m.pop("reasoning_content", None)
-        out.append(m)
-    return out
 
 
 def _literal(v):
@@ -222,8 +219,28 @@ def _tool_args(m):
     return dict(m, tool_calls=out)
 
 
-def _st_character(name):
-    return re.sub(r"[\s\d]+$", "", (name or "").strip()).lower()
+def _chat(msgs, f, spec):
+    """the domain's options applied to its messages; chat rejects tool messages, tool_chat passes them through"""
+    rep, think = spec.get("replace"), spec.get("split_think", False)
+    out = []
+    for m in msgs:
+        if f == "chat" and (m["role"] == "tool" or m.get("tool_calls")):
+            raise BadRow("tool call / tool message in a chat domain (use format tool_chat)")
+        if f == "tool_chat":
+            m = _tool_args(m)
+        c = m.get("content")
+        if rep and isinstance(c, str) and c.strip() in rep:
+            m["content"] = rep[c.strip()]
+        if think and m["role"] == "assistant" and not m.get("reasoning_content"):
+            r, m["content"] = _split_think(m.get("content"))
+            if r:
+                m["reasoning_content"] = r
+        if not m.get("reasoning_content"):
+            m.pop("reasoning_content", None)
+        if not (m.get("content") or m.get("reasoning_content") or m.get("tool_calls") or m["role"] == "tool"):
+            continue                                    # an empty turn
+        out.append(m)
+    return _merge_roles(out)
 
 
 def documents(name, spec, rng, tok):
@@ -237,6 +254,8 @@ def documents(name, spec, rng, tok):
 
 def _documents(name, spec, rng, tok):
     f = spec["format"]
+    if f not in FORMATS:
+        raise SystemExit(f"{name}: unknown format {f!r} (formats: {', '.join(FORMATS)})")
     if f == "text_file":
         path = os.path.expandvars(spec["files"])
         ids = tok.encode(open(path, encoding="utf-8").read())
@@ -246,24 +265,6 @@ def _documents(name, spec, rng, tok):
         for i in order:
             yield f"{path}#{i}", f"{path}#{i}", ("ids", ids[i * tok.n_ctx:(i + 1) * tok.n_ctx])
         return
-    if f == "sillytavern":
-        for path in _files(spec, rng):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    lines = [json.loads(ln) for ln in fh if ln.strip()]
-            except ValueError as e:
-                raise SystemExit(f"{path}: not a SillyTavern JSONL export ({e})") from None
-            if not lines:
-                continue
-            head = lines[0]
-            msgs = [{"role": "user" if m.get("is_user") else "assistant", "content": m["mes"]}
-                    for m in lines[1:] if not m.get("is_system") and m.get("mes")]
-            if len(msgs) >= 2:
-                group = fmt(spec["group"], head) if "group" in spec else _st_character(Path(path).parent.name)
-                yield group, path, ("chat", _merge_roles(msgs), None)
-        return
-    if f not in FORMATS:
-        raise SystemExit(f"{name}: unknown format {f!r}")
     for rid, row in rows(spec, rng):
         try:
             yield (*_row_item(f, spec, rid, row),)
@@ -277,27 +278,21 @@ def _row_item(f, spec, rid, row):
         raise BadRow(f"empty group key from {spec['group']!r}")
     if f == "text":
         return group, rid, ("text", fmt(spec["text"], row))
-    if f == "chat":
-        return group, rid, ("chat", _merge_roles(_roles_ok(_turns(spec["turns"], row, spec.get("split_think", False), spec.get("replace")), spec)), None)
-    if f == "sharegpt":
-        if spec["field"] not in row:
-            raise BadRow(f"no field {spec['field']!r}")
-        msgs = []
-        for m in row[spec["field"]]:
-            if "value" not in m and "content" not in m:
-                raise BadRow(f"message without value / content: {str(m)[:120]}")
-            msgs.append({"role": _role(m.get("from") or m.get("role"), spec),
-                         "content": m.get("value") if "value" in m else m.get("content")})
-        msgs = [m for m in msgs + _turns(spec.get("append", []), row) if m["content"]]
-        return group, rid, ("chat", _merge_roles(msgs), None)
-    if spec["field"] not in row:                         # messages
-        raise BadRow(f"no field {spec['field']!r}")
-    msgs = [_tool_args({k: v for k, v in m.items() if v is not None}) for m in _literal(row[spec["field"]])]
+    if "turns" in spec:
+        msgs = [_message({k: fmt(v, row) for k, v in t.items()}, spec) for t in spec["turns"]]
+    else:
+        if spec["messages"] not in row:
+            raise BadRow(f"no field {spec['messages']!r}")
+        src = _literal(row[spec["messages"]])
+        if not isinstance(src, list):
+            raise BadRow(f"field {spec['messages']!r} is a {type(src).__name__}, not a list of messages")
+        msgs = [_message(m, spec) for m in src]
+        msgs += [_message({k: fmt(v, row) for k, v in t.items()}, spec) for t in spec.get("append", [])]
     tools = _literal(row[spec["tools"]]) if spec.get("tools") else None
-    return group, rid, ("chat", _roles_ok(msgs, spec), tools)
+    return group, rid, ("chat", _chat(msgs, f, spec), tools)
 
 
-FORMATS = ("text", "chat", "sharegpt", "messages", "sillytavern", "text_file")
+FORMATS = ("text", "text_file", "chat", "tool_chat")
 
 
 # ------------------------------------------------------------------------------------------------ tokens
@@ -498,8 +493,20 @@ def check(spec, log=print):
     for name, d in spec["domains"].items():
         if d.get("weight", 0) <= 0:
             continue
-        if d.get("format") not in FORMATS:
-            bad.append(f"{name}: unknown format {d.get('format')!r}")
+        f = d.get("format")
+        if f not in FORMATS:
+            bad.append(f"{name}: unknown format {f!r} (formats: {', '.join(FORMATS)})")
+        elif f == "text" and "text" not in d:
+            bad.append(f"{name}: format text needs \"text\" (a template over the row, e.g. \"{{text}}\")")
+        elif f in ("chat", "tool_chat"):
+            if ("turns" in d) == ("messages" in d):
+                bad.append(f"{name}: format {f} needs exactly one of \"turns\" (templates) and \"messages\" (a field)")
+            if "append" in d and "messages" not in d:
+                bad.append(f"{name}: \"append\" goes with \"messages\"")
+            if "tools" in d and f != "tool_chat":
+                bad.append(f"{name}: \"tools\" is for format tool_chat")
+        if "field" in d:
+            bad.append(f"{name}: \"field\" is now \"messages\" (the row field that holds the message list)")
         if "skip_bad_rows" in d and not isinstance(d["skip_bad_rows"], bool):
             bad.append(f"{name}: skip_bad_rows {d['skip_bad_rows']!r} is not true / false")
         pat = os.path.expandvars(d.get("files", ""))
